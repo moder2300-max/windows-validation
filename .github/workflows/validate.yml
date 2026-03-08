@@ -80,72 +80,24 @@ jobs:
           } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-      - name: Test SSH outbound connectivity to Pinggy
-        id: pinggy_test
+      - name: Establish tunnel with Bore
         run: |
-          Write-Host "Testing basic connectivity to pinggy.io..."
-          $testNet = Test-NetConnection -ComputerName a.pinggy.io -Port 443 -WarningAction SilentlyContinue
-          if ($testNet.TcpTestSucceeded) {
-            Write-Host "✅ Port 443 is reachable."
-            $sshVersion = ssh -V 2>&1
-            Write-Host "SSH version: $sshVersion"
-            
-            $result = ssh -p 443 -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=no a.pinggy.io echo "SSH OK" 2>&1
-            if ($result -match "SSH OK") {
-              Write-Host "✅ SSH connection successful."
-              echo "pinggy_ok=true" >> $env:GITHUB_OUTPUT
-            } else {
-              Write-Host "❌ SSH connection failed: $result"
-              echo "pinggy_ok=false" >> $env:GITHUB_OUTPUT
-            }
-          } else {
-            Write-Host "❌ Port 443 is blocked or unreachable."
-            echo "pinggy_ok=false" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Establish tunnel
-        run: |
-          if ("${{ steps.pinggy_test.outputs.pinggy_ok }}" -eq "true") {
-            Write-Host "Pinggy is reachable, trying Pinggy tunnel..."
-            
-            $sshProc = Start-Process -FilePath "ssh.exe" `
-              -ArgumentList "-p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o ServerAliveInterval=30 -o ServerAliveCountMax=3 a.pinggy.io" `
-              -NoNewWindow -RedirectStandardOutput "$env:TEMP\pinggy.log" -RedirectStandardError "$env:TEMP\pinggy_err.log" -PassThru
-            
-            Start-Sleep -Seconds 20
-            
-            $logOut = Get-Content "$env:TEMP\pinggy.log" -ErrorAction SilentlyContinue
-            $logErr = Get-Content "$env:TEMP\pinggy_err.log" -ErrorAction SilentlyContinue
-            $fullLog = $logOut + $logErr
-            
-            $addrMatch = $fullLog | Select-String "(tcp://[a-z0-9-]+\.(a\.)?free\.?pinggy\.(link|online|io):\d+)"
-            if ($addrMatch) {
-              $publicAddr = $addrMatch.Matches.Groups[1].Value
-              $message = "🌐 **Tunnel active (Pinggy.io)**`n`n**Full address:** $publicAddr`n**RDP connect:** $publicAddr"
-              
-              $body = @{ content = $message } | ConvertTo-Json
-              Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-              
-              $env:TUNNEL_PID = $sshProc.Id
-              exit 0
-            } else {
-              Write-Host "Pinggy tunnel failed to get address, falling back to Bore..."
-              $sshProc | Stop-Process -Force
-            }
-          }
-          
-          Write-Host "Using Bore tunnel (fallback)..."
-          
           function Start-BoreTunnel {
-            param([int]$maxAttempts = 6, [int]$delaySeconds = 12)
+            param([int]$maxAttempts = 8, [int]$delaySeconds = 15)
             $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
             $zip = "$env:TEMP\bore.zip"
             $logPath = "$env:TEMP\bore.log"
             
             for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
               Write-Host "Bore attempt $attempt of $maxAttempts"
-              Invoke-WebRequest -Uri $boreUrl -OutFile $zip
-              Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
+              try {
+                Invoke-WebRequest -Uri $boreUrl -OutFile $zip -TimeoutSec 30
+                Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
+              } catch {
+                Write-Host "Download/Extract failed, retrying..."
+                Start-Sleep -Seconds 5
+                continue
+              }
               
               $proc = Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
                 -ArgumentList "local 3389 --to bore.pub" `
@@ -154,29 +106,22 @@ jobs:
               Start-Sleep -Seconds $delaySeconds
               
               if (Test-Path $logPath) {
-                $log = Get-Content $logPath
+                $log = Get-Content $logPath -ErrorAction SilentlyContinue
                 if ($log -match "bore\.pub:(\d+)") {
-                  return @{ Port = $Matches[1]; Process = $proc }
+                  $port = $Matches[1]
+                  $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP port:** 3389`n(حط bore.pub:$port في mstsc)"
+                  $body = @{ content = $message } | ConvertTo-Json
+                  Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+                  $env:TUNNEL_PID = $proc.Id
+                  exit 0
                 }
               }
               $proc | Stop-Process -Force
               Start-Sleep -Seconds 5
             }
-            return $null
-          }
-          
-          $boreInfo = Start-BoreTunnel -maxAttempts 6 -delaySeconds 12
-          if ($boreInfo -and $boreInfo.Port) {
-            $publicAddr = "bore.pub:$($boreInfo.Port)"
-            $message = "🌐 **Tunnel active (Bore fallback)**`n`n**Address:** $publicAddr`n**RDP port:** 3389"
+            $message = "⚠️ **Bore tunnel failed after $maxAttempts attempts**`nCheck runner network or retry later."
             $body = @{ content = $message } | ConvertTo-Json
             Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-            $env:TUNNEL_PID = $boreInfo.Process.Id
-          } else {
-            $message = "⚠️ **All tunnels failed (Pinggy & Bore)**"
-            $body = @{ content = $message } | ConvertTo-Json
-            Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-          }
 
       - name: Run extended tests
         run: |
