@@ -79,38 +79,35 @@ jobs:
           echo "USER_NAME=$usr" >> $env:GITHUB_ENV
           echo "USER_PASS=$pwd" >> $env:GITHUB_ENV
 
-      - name: Install cloudflared (TryCloudflare)
-        run: |
-          $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $exe = "$env:TEMP\cloudflared.exe"
-          
-          Invoke-WebRequest -Uri $url -OutFile $exe
-          
-          # تشغيل النفق في الخلفية
-          Start-Process -FilePath $exe -ArgumentList "tunnel --url tcp://localhost:3389" -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\cloudflared.log" -RedirectStandardError "$env:TEMP\cloudflared.err"
-          
-          Start-Sleep -Seconds 45   # انتظار كافٍ لظهور الـ URL
-
-      - name: Extract TryCloudflare URL and send credentials
+      - name: Start ngrok TCP tunnel
         run: |
           $usr = "$env:USER_NAME"
           $pwd = "$env:USER_PASS"
-          $log = "$env:TEMP\cloudflared.log"
-          $err = "$env:TEMP\cloudflared.err"
           
-          $logData = ""
-          if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
-          if (Test-Path $err) { $logData += "`nErrors: " + (Get-Content $err -Raw -ErrorAction SilentlyContinue) }
+          # تحميل ngrok
+          Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+          Expand-Archive ngrok.zip -DestinationPath . -Force
           
-          # استخراج رابط النفق (مثل https://xxxx.trycloudflare.com)
-          $tunnelUrl = if ($logData -match "https://.*\.trycloudflare\.com") { $Matches[0] } else { "Not found" }
+          # إضافة auth token من الأسرار
+          .\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
           
-          if ($tunnelUrl -like "*trycloudflare.com") {
-            $msg = "Cloudflare Tunnel RDP ready!`n`nURL: $tunnelUrl`nUsername: $usr`nPassword: $pwd`n`nConnect using mstsc → Computer: $tunnelUrl"
+          # تشغيل ngrok في الخلفية مع تسجيل الإخراج
+          Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
+          
+          # انتظار كافٍ لظهور معلومات النفق
+          Start-Sleep -Seconds 45
+          
+          # قراءة السجل واستخراج المنفذ
+          $log = Get-Content "$env:TEMP\ngrok.log" -Raw -ErrorAction SilentlyContinue
+          
+          if ($log -match "tcp://0\.tcp\.ngrok\.io:(\d+)") {
+            $port = $Matches[1]
+            $msg = "ngrok RDP جاهز!`nTarget: 0.tcp.ngrok.io:$port`nUser: $usr`nPass: $pwd"
           } else {
-            $msg = "Cloudflare Tunnel failed to start.`nLog:`n$logData"
+            $msg = "ngrok فشل في البدء.`n$log"
           }
           
+          # إرسال الإشعار عبر webhook
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
@@ -132,25 +129,27 @@ jobs:
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
 
-          $cf = Get-Process cloudflared -ErrorAction SilentlyContinue
-          if ($cf) { $rep += "CLOUDFLARED: OK ($($cf.Id))`n" } else { $rep += "CLOUDFLARED: ERR`n" }
+          $ng = Get-Process ngrok -ErrorAction SilentlyContinue
+          if ($ng) { $rep += "NGROK: OK ($($ng.Id))`n" } else { $rep += "NGROK: ERR`n" }
 
           $body = @{ content = $rep } | ConvertTo-Json -Depth 10
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
 
-      - name: Run Extended Validation (with cloudflared monitoring)
+      - name: Run Extended Validation (with ngrok monitoring)
         run: |
-          # دالة لإعادة تشغيل cloudflared إذا توقف
-          function Restart-Cloudflared {
-            $exe = "$env:TEMP\cloudflared.exe"
+          # دالة لإعادة تشغيل ngrok إذا توقف
+          function Restart-Ngrok {
+            $exe = ".\ngrok.exe"
             if (-not (Test-Path $exe)) {
-              $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-              Invoke-WebRequest -Uri $url -OutFile $exe
+              Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
+              Expand-Archive ngrok.zip -DestinationPath . -Force
             }
-            Start-Process -FilePath $exe -ArgumentList "tunnel --url tcp://localhost:3389" -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\cloudflared.log" -RedirectStandardError "$env:TEMP\cloudflared.err"
+            # التأكد من وجود auth token (قد تحتاج إلى إعادة إضافته إذا تم حذف الملف)
+            .\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }} > $null 2>&1
+            Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
             Start-Sleep -Seconds 10
-            return Get-Process cloudflared -ErrorAction SilentlyContinue
+            return Get-Process ngrok -ErrorAction SilentlyContinue
           }
 
           $restartCount = 0
@@ -158,16 +157,17 @@ jobs:
           $endTime = (Get-Date).AddMinutes(190)
 
           while ((Get-Date) -lt $endTime -and $restartCount -lt $maxRestarts) {
-            # 1. التحقق من وجود عملية cloudflared
-            $cf = Get-Process cloudflared -ErrorAction SilentlyContinue
-            if (-not $cf) {
-              Write-Host "cloudflared not running. Restarting... Attempt $($restartCount+1)"
-              $cf = Restart-Cloudflared
-              if ($cf) {
+            # 1. التحقق من وجود عملية ngrok
+            $ng = Get-Process ngrok -ErrorAction SilentlyContinue
+            if (-not $ng) {
+              Write-Host "ngrok not running. Restarting... Attempt $($restartCount+1)"
+              $ng = Restart-Ngrok
+              if ($ng) {
                 $restartCount++
-                Write-Host "cloudflared restarted successfully."
+                Write-Host "ngrok restarted successfully."
+                # يمكن إرسال إشعار بإعادة التشغيل إذا أردت (اختياري)
               } else {
-                Write-Host "Failed to restart cloudflared."
+                Write-Host "Failed to restart ngrok."
               }
             }
 
@@ -184,13 +184,13 @@ jobs:
             Start-Sleep -Seconds 900
           }
 
-          # إيقاف cloudflared في النهاية
-          Get-Process cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force
+          # إيقاف ngrok في النهاية
+          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "Extended validation completed. Total restarts: $restartCount"
 
       - name: Cleanup Environment
         run: |
-          Get-Process -Name "cloudflared" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
       - name: Finalize Check
