@@ -80,10 +80,10 @@ jobs:
           } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-      - name: Establish tunnel with Bore (reliable)
+      - name: Establish tunnel with Bore (enhanced)
         run: |
           function Start-BoreTunnel {
-            param([int]$maxAttempts = 8, [int]$delaySeconds = 15)
+            param([int]$maxAttempts = 10, [int]$delaySeconds = 20)
             $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
             $zip = "$env:TEMP\bore.zip"
             $logPath = "$env:TEMP\bore.log"
@@ -91,35 +91,46 @@ jobs:
             for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
               Write-Host "Bore attempt $attempt of $maxAttempts"
               try {
-                Invoke-WebRequest -Uri $boreUrl -OutFile $zip -TimeoutSec 30
+                Invoke-WebRequest -Uri $boreUrl -OutFile $zip -TimeoutSec 40
                 Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
               } catch {
-                Write-Host "Download/Extract failed, retrying..."
-                Start-Sleep -Seconds 5
+                Write-Host "Download failed: $($_.Exception.Message). Retrying..."
+                Start-Sleep -Seconds 8
                 continue
               }
               
+              # شغل bore مع --log-level debug للوجز أكتر
               $proc = Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
-                -ArgumentList "local 3389 --to bore.pub" `
+                -ArgumentList "local 3389 --to bore.pub --log-level debug" `
                 -NoNewWindow -RedirectStandardOutput $logPath -PassThru
               
-              Start-Sleep -Seconds $delaySeconds
-              
-              if (Test-Path $logPath) {
-                $log = Get-Content $logPath -ErrorAction SilentlyContinue
-                if ($log -match "bore\.pub:(\d+)") {
-                  $port = $Matches[1]
-                  $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP port:** 3389`n(حط bore.pub:$port في mstsc مباشرة)"
-                  $body = @{ content = $message } | ConvertTo-Json
-                  Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-                  $env:TUNNEL_PID = $proc.Id
-                  return @{ Success = $true; Port = $port; Process = $proc }
+              # انتظر أطول + اقرأ الـ log كل 5 ثواني
+              $found = $false
+              for ($wait = 0; $wait -lt 40; $wait += 5) {
+                Start-Sleep -Seconds 5
+                if (Test-Path $logPath) {
+                  $log = Get-Content $logPath -ErrorAction SilentlyContinue
+                  Write-Host "Log snippet: $($log -join ' | ')"
+                  if ($log -match "bore\.pub:(\d+)") {
+                    $port = $Matches[1]
+                    $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP port:** 3389`n(حط bore.pub:$port في mstsc)"
+                    $body = @{ content = $message } | ConvertTo-Json
+                    Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+                    $env:TUNNEL_PID = $proc.Id
+                    $found = $true
+                    break
+                  }
                 }
               }
+              
+              if ($found) { return @{ Success = $true; Port = $port; Process = $proc } }
+              
               $proc | Stop-Process -Force
-              Start-Sleep -Seconds 5
+              Write-Host "No port found in attempt $attempt. Retrying..."
+              Start-Sleep -Seconds 8
             }
-            $message = "⚠️ **Bore tunnel failed after $maxAttempts attempts**`nRetry the workflow or check network."
+            
+            $message = "⚠️ **Bore tunnel failed after $maxAttempts attempts**`nPossible downtime or network issue. Retry workflow later."
             $body = @{ content = $message } | ConvertTo-Json
             Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
             return @{ Success = $false }
@@ -127,7 +138,7 @@ jobs:
 
           $result = Start-BoreTunnel
           if (-not $result.Success) {
-            Write-Host "Tunnel failed - job will continue but no RDP access."
+            Write-Host "Tunnel failed - continuing job without RDP access."
           }
 
       - name: Run extended tests
