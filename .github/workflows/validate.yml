@@ -77,30 +77,38 @@ jobs:
           # تحميل bore
           $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
           $zip = "$env:TEMP\bore.zip"
-          $logPath = "$env:TEMP\bore.log"
+          $outLog = "$env:TEMP\bore_out.log"
+          $errLog = "$env:TEMP\bore_err.log"
           
           Invoke-WebRequest -Uri $boreUrl -OutFile $zip
           Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
           
-          # شغل bore
+          # شغل bore مع تسجيل كلاً من الخرج العادي والأخطاء (لأن bore يكتب في stderr)
           Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
             -ArgumentList "local 3389 --to bore.pub" `
-            -NoNewWindow -RedirectStandardOutput $logPath -PassThru
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $outLog `
+            -RedirectStandardError $errLog `
+            -PassThru
           
-          # انتظر أطول عشان يستقر
-          Start-Sleep -Seconds 30
+          # انتظر حتى يتصل بالسيرفر ويحصل على بورت
+          Start-Sleep -Seconds 15
           
-          # استخراج الـ port باستخدام regex أقوى
-          $log = Get-Content $logPath -ErrorAction SilentlyContinue
+          # قراءة اللوجات كنص واحد (Raw) لحل مشكلة المصفوفات في الـ Regex
+          $log = ""
+          if (Test-Path $outLog) { $log += Get-Content $outLog -Raw -ErrorAction SilentlyContinue }
+          if (Test-Path $errLog) { $log += Get-Content $errLog -Raw -ErrorAction SilentlyContinue }
+          
           $port = $null
-          if ($log -match "(?:listening at )?bore\.pub:(\d+)") {
+          if ($log -match "bore\.pub:(\d+)") {
             $port = $Matches[1]
           }
           
           if ($port) {
             $message = "🌐 **Bore Tunnel جاهز**`n`n**Address:** bore.pub:$port`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc فورًا وحط bore.pub:$port في Computer)"
           } else {
-            $message = "⚠️ Bore فشل في استخراج الـ port - شوف اللوجز"
+            # في حالة الفشل، نرسل اللوج لمعرفة السبب
+            $message = "⚠️ Bore فشل في استخراج الـ port - شوف اللوجز:`n$log"
           }
           $body = @{ content = $message } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
