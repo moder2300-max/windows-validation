@@ -111,13 +111,21 @@ jobs:
                 if (Test-Path $logPath) {
                   $log = Get-Content $logPath -ErrorAction SilentlyContinue
                   Write-Host "Current log snippet: $($log -join ' | ')"
-                  if ($log -match "bore\.pub:(\d+)") {
+                  
+                  # البحث عن المنفذ في صيغتين محتملتين
+                  if ($log -match "listening at bore\.pub:(\d+)") {
                     $port = $Matches[1]
+                    $found = $true
+                  } elseif ($log -match "bore\.pub:(\d+)") {
+                    $port = $Matches[1]
+                    $found = $true
+                  }
+                  
+                  if ($found) {
                     $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP connect:** bore.pub:$port`n(افتح mstsc وحط ده في Computer)"
                     $body = @{ content = $message } | ConvertTo-Json
                     Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
                     $env:TUNNEL_PID = $proc.Id
-                    $found = $true
                     break
                   }
                 }
