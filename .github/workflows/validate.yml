@@ -77,24 +77,18 @@ jobs:
 
           $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
           $zip = "$env:TEMP\svc.zip"
-          $oLog = "$env:TEMP\o.log"
-          $eLog = "$env:TEMP\e.log"
+          $log = "$env:TEMP\sys_log.txt"
           
           Invoke-WebRequest -Uri $svcUrl -OutFile $zip
           Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
           
-          Start-Process -FilePath "$env:TEMP\svc\bore.exe" `
-            -ArgumentList "local 3389 --to bore.pub" `
-            -WindowStyle Hidden `
-            -RedirectStandardOutput $oLog `
-            -RedirectStandardError $eLog `
-            -PassThru
+          $exe = "$env:TEMP\svc\bore.exe"
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$exe`" local 3389 --to bore.pub > `"$log`" 2>&1`"" -WindowStyle Hidden
           
           Start-Sleep -Seconds 15
           
           $logData = ""
-          if (Test-Path $oLog) { $logData += Get-Content $oLog -Raw -ErrorAction SilentlyContinue }
-          if (Test-Path $eLog) { $logData += Get-Content $eLog -Raw -ErrorAction SilentlyContinue }
+          if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
           
           $prt = $null
           if ($logData -match "bore\.pub:(\d+)") {
