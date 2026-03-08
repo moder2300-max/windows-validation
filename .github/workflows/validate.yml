@@ -138,7 +138,7 @@ jobs:
 
       - name: Run Extended Validation
         run: |
-          $end = (Get-Date).AddMinutes(350)
+          $end = (Get-Date).AddMinutes(190)
           while ((Get-Date) -lt $end) {
             Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
             $minute = (Get-Date).Minute
