@@ -25,6 +25,7 @@ jobs:
           cd ValidationApp
           dotnet add package Newtonsoft.Json --version 13.0.3
           dotnet add package Serilog --version 4.0.0
+          dotnet add package Serilog.Sinks.Console --version 6.0.0
           dotnet add package Microsoft.Extensions.Logging --version 8.0.0
           @"
           using System;
