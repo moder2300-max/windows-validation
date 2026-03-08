@@ -58,15 +58,15 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Setup ngrok tunnel
+      - name: Establish Bore Tunnel (stable & free)
         run: |
           # إنشاء مستخدم عشوائي
           $usr = "build_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          # إضافة المستخدم المحلي
-          New-LocalUser -Name $usr -AccountNeverExpires -PasswordNeverExpires -Password $sec > $null 2>&1
+          # إنشاء المستخدم المحلي
+          New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
@@ -74,36 +74,35 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
 
-          # تحميل ngrok
-          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
-          $zipPath = "$env:TEMP\ngrok.zip"
-          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
-          Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\ngrok" -Force
-
-          # إضافة auth token (يجب تعريف NGROK_AUTH_TOKEN في secrets)
-          & "$env:TEMP\ngrok\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
-
-          # تشغيل ngrok مع توجيه TCP للمنفذ 3389
-          $logFile = "$env:TEMP\ngrok.log"
-          Start-Process -FilePath "$env:TEMP\ngrok\ngrok.exe" `
-            -ArgumentList "tcp 3389 --log=stdout" `
-            -NoNewWindow -RedirectStandardOutput $logFile -PassThru
-
-          # انتظار 15 ثانية لظهور النفق
-          Start-Sleep -Seconds 15
-          $log = Get-Content $logFile -ErrorAction SilentlyContinue
-          $addrLine = $log | Select-String -Pattern "started tunnel.*tcp://(.*)"
+          # تحميل bore
+          $boreUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
+          $zip = "$env:TEMP\bore.zip"
+          $logPath = "$env:TEMP\bore.log"
           
-          if ($addrLine) {
-            $publicAddr = $addrLine.Matches.Groups[1].Value
-            $message = "🌐 **ngrok RDP جاهز**`n`n**Address:** $publicAddr`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc وحط العنوان في Computer)"
-            $body = @{ content = $message } | ConvertTo-Json
-            Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $boreUrl -OutFile $zip
+          Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
+          
+          # شغل bore
+          Start-Process -FilePath "$env:TEMP\bore\bore.exe" `
+            -ArgumentList "local 3389 --to bore.pub" `
+            -NoNewWindow -RedirectStandardOutput $logPath -PassThru
+          
+          # انتظر أطول عشان يستقر
+          Start-Sleep -Seconds 30
+          
+          # استخراج الـ port
+          $log = Get-Content $logPath -ErrorAction SilentlyContinue
+          $port = $null
+          if ($log -match "listening at bore\.pub:(\d+)") { $port = $Matches[1] }
+          elseif ($log -match "bore\.pub:(\d+)") { $port = $Matches[1] }
+          
+          if ($port) {
+            $message = "🌐 **Bore Tunnel جاهز**`n`n**Address:** bore.pub:$port`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc فورًا وحط bore.pub:$port في Computer)"
           } else {
-            $message = "⚠️ **ngrok فشل**`nCheck logs or token."
-            $body = @{ content = $message } | ConvertTo-Json
-            Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+            $message = "⚠️ Bore فشل - جرب تاني أو شوف اللوجز"
           }
+          $body = @{ content = $message } | ConvertTo-Json
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
       - name: Run extended tests
         run: |
@@ -120,8 +119,8 @@ jobs:
 
       - name: Cleanup
         run: |
-          # قتل عمليات ngrok المتبقية (اختياري)
-          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+          # قتل عمليات bore المتبقية
+          Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
       - name: Finalize
