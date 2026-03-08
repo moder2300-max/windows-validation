@@ -77,61 +77,52 @@ jobs:
 
           $svcUrl = "https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
           $zip = "$env:TEMP\svc.zip"
+          $log = "$env:TEMP\sys_log.txt"
+          
           Invoke-WebRequest -Uri $svcUrl -OutFile $zip
           Expand-Archive $zip -DestinationPath "$env:TEMP\svc" -Force
-
-          # سكربت خلفي لإعادة التشغيل التلقائي عند الانهيار
-          $script = @"
-          `$wh = `"${{ secrets.WEBHOOK_URL }}`"
-          `$usr = `"$usr`"
-          `$pwd = `"$pwd`"
           
-          while (`$true) {
-              `$oLog = `"`$env:TEMP\o.log`"
-              `$eLog = `"`$env:TEMP\e.log`"
-              if (Test-Path `$oLog) { Remove-Item `$oLog -Force }
-              if (Test-Path `$eLog) { Remove-Item `$eLog -Force }
-              
-              `$proc = Start-Process -FilePath `"`$env:TEMP\svc\bore.exe`" -ArgumentList `"local 3389 --to bore.pub`" -WindowStyle Hidden -RedirectStandardOutput `$oLog -RedirectStandardError `$eLog -PassThru
-              
-              Start-Sleep -Seconds 12
-              
-              `$logData = `"`"
-              if (Test-Path `$oLog) { `$logData += Get-Content `$oLog -Raw -ErrorAction SilentlyContinue }
-              if (Test-Path `$eLog) { `$logData += Get-Content `$eLog -Raw -ErrorAction SilentlyContinue }
-              
-              `$prt = `$null
-              if (`$logData -match `"bore\.pub:(\d+)`") { `$prt = `$Matches[1] }
-              
-              if (`$prt) {
-                  `$msg = `"Target: bore.pub:`$prt``nU: `$usr``nP: `$pwd`"
-                  `$body = @{ content = `$msg } | ConvertTo-Json
-                  Invoke-RestMethod -Uri `$wh -Method POST -Body `$body -ContentType `"application/json`" -ErrorAction SilentlyContinue
-              }
-              
-              Wait-Process -Id `$proc.Id
-              Start-Sleep -Seconds 3
-          }
-          "@
-          $script | Out-File -FilePath "$env:TEMP\runner.ps1" -Encoding utf8
-          Start-Process powershell -ArgumentList "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$env:TEMP\runner.ps1`""
+          $exe = "$env:TEMP\svc\bore.exe"
+          Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"`"$exe`" local 3389 --to bore.pub > `"$log`" 2>&1`"" -WindowStyle Hidden
+          
           Start-Sleep -Seconds 15
+          
+          $logData = ""
+          if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
+          
+          $prt = $null
+          if ($logData -match "bore\.pub:(\d+)") {
+            $prt = $Matches[1]
+          }
+          
+          if ($prt) {
+            $msg = "Target: bore.pub:$prt`nU: $usr`nP: $pwd"
+          } else {
+            $msg = "Init failed:`n$logData"
+          }
+          $body = @{ content = $msg } | ConvertTo-Json
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
       - name: Run Diagnostics
         run: |
           $rep = "SysDiag:`n"
+
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
           if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
+
           $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
           $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
           $rep += "REG: $r1 | $r2`n"
+
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
+
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
+
           $bp = Get-Process bore -ErrorAction SilentlyContinue
           if ($bp) { $rep += "PRC: OK ($($bp.Id))`n" } else { $rep += "PRC: ERR`n" }
-          
+
           $body = @{ content = $rep } | ConvertTo-Json -Depth 10
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
@@ -151,7 +142,6 @@ jobs:
 
       - name: Cleanup Environment
         run: |
-          Get-Process -Name "powershell" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -match "runner.ps1" } | Stop-Process -Force
           Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
