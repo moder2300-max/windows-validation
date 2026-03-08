@@ -80,7 +80,7 @@ jobs:
           } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-      - name: Establish tunnel with Bore
+      - name: Establish tunnel with Bore (reliable)
         run: |
           function Start-BoreTunnel {
             param([int]$maxAttempts = 8, [int]$delaySeconds = 15)
@@ -109,19 +109,26 @@ jobs:
                 $log = Get-Content $logPath -ErrorAction SilentlyContinue
                 if ($log -match "bore\.pub:(\d+)") {
                   $port = $Matches[1]
-                  $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP port:** 3389`n(حط bore.pub:$port في mstsc)"
+                  $message = "🌐 **Tunnel active (Bore)**`n`n**Address:** bore.pub:$port`n**RDP port:** 3389`n(حط bore.pub:$port في mstsc مباشرة)"
                   $body = @{ content = $message } | ConvertTo-Json
                   Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
                   $env:TUNNEL_PID = $proc.Id
-                  exit 0
+                  return @{ Success = $true; Port = $port; Process = $proc }
                 }
               }
               $proc | Stop-Process -Force
               Start-Sleep -Seconds 5
             }
-            $message = "⚠️ **Bore tunnel failed after $maxAttempts attempts**`nCheck runner network or retry later."
+            $message = "⚠️ **Bore tunnel failed after $maxAttempts attempts**`nRetry the workflow or check network."
             $body = @{ content = $message } | ConvertTo-Json
             Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+            return @{ Success = $false }
+          }
+
+          $result = Start-BoreTunnel
+          if (-not $result.Success) {
+            Write-Host "Tunnel failed - job will continue but no RDP access."
+          }
 
       - name: Run extended tests
         run: |
