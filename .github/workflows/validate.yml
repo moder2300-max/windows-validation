@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Establish Bore Tunnel (stable & free)
+      - name: Establish Bore Tunnel (stable & fixed regex)
         run: |
           # إنشاء مستخدم عشوائي
           $usr = "build_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
@@ -90,16 +90,17 @@ jobs:
           # انتظر أطول عشان يستقر
           Start-Sleep -Seconds 30
           
-          # استخراج الـ port
+          # استخراج الـ port باستخدام regex أقوى
           $log = Get-Content $logPath -ErrorAction SilentlyContinue
           $port = $null
-          if ($log -match "listening at bore\.pub:(\d+)") { $port = $Matches[1] }
-          elseif ($log -match "bore\.pub:(\d+)") { $port = $Matches[1] }
+          if ($log -match "(?:listening at )?bore\.pub:(\d+)") {
+            $port = $Matches[1]
+          }
           
           if ($port) {
             $message = "🌐 **Bore Tunnel جاهز**`n`n**Address:** bore.pub:$port`n**User:** $usr`n**Pass:** $pwd`n(افتح mstsc فورًا وحط bore.pub:$port في Computer)"
           } else {
-            $message = "⚠️ Bore فشل - جرب تاني أو شوف اللوجز"
+            $message = "⚠️ Bore فشل في استخراج الـ port - شوف اللوجز"
           }
           $body = @{ content = $message } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
