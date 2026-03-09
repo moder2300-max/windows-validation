@@ -1,4 +1,4 @@
-name: .NET 8 Windows Validation
+name: .IPTV APP
 
 on:
   workflow_dispatch:
@@ -58,19 +58,28 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Configure RDP + Create Random User + Tailscale
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+          hostname: gh-runner-${{ github.run_id }}
+
+      - name: Configure RDP + Create Random User + Get Tailscale IP + Webhook
         run: |
           # === RDP Configuration ===
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          # اصلاح اوامر الفايروال (بدون ErrorAction)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # === Create Random Admin User (زي الكود الأصلي) ===
+          # === Create Random Admin User ===
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
@@ -79,20 +88,10 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # Save for later steps
           echo "RDP_USER=$usr" >> $env:GITHUB_ENV
           echo "RDP_PASS=$pwd" >> $env:GITHUB_ENV
 
-          # === Install Tailscale (من الكود التاني) ===
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-          # === Connect Tailscale (بدل الـ Bore كاملاً) ===
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes=false
-
+          # === Get Tailscale IP ===
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -100,43 +99,42 @@ jobs:
               if (-not $tsIP) { Start-Sleep -Seconds 6 }
               $retries++
           }
-
-          if (-not $tsIP) {
-              $tsIP = "IP_Not_Assigned"
-          }
+          if (-not $tsIP) { $tsIP = "IP_Not_Assigned" }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-          # === Send Credentials to Webhook (زي الكود الأصلي) ===
-          $msg = "✅ Tailscale RDP Ready`n`nIP: $tsIP`nUser: $usr`nPass: $pwd`n`nRunner: gh-runner-$env:GITHUB_RUN_ID"
+          # === Send Credentials to Webhook ===
+          $msg = "✅ Tailscale RDP Ready`n`nIP: $tsIP`nUser: $usr`nPass: $pwd`n`nRunner: gh-runner-${{ github.run_id }}"
           $body = @{ content = $msg } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+          # استخدمنا المتغير الصحيح هنا بعد إضافة السر في GitHub
+          if ("${{ secrets.WEBHOOK_URL }}" -ne "") {
+              Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+          } else {
+              Write-Host "Webhook URL is missing. Check your GitHub Secrets."
+          }
 
       - name: Run Diagnostics
         run: |
           $rep = "=== Tailscale RDP Diagnostics ===`n"
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
           $rep += "RDP Service: $($ts.Status)`n"
-
           $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
           $rep += "RDP Registry: $r1`n"
-
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           $rep += "Port 3389: $(if($pc){'OK'}else{'ERR'})`n"
-
           $tp = Get-Process -Name "tailscale" -ErrorAction SilentlyContinue
           $rep += "Tailscale Process: $(if($tp){'Running'}else{'Not Found'})`n"
           $rep += "Tailscale IP: $env:TAILSCALE_IP`n"
-
           $body = @{ content = $rep } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+          if ("${{ secrets.WEBHOOK_URL }}" -ne "") {
+              Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+          }
 
       - name: Run Extended Validation (5 ساعات ونصف)
         run: |
           $end = (Get-Date).AddMinutes(315)
           while ((Get-Date) -lt $end) {
             Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
-            $minute = (Get-Date).Minute
-            if ($minute % 30 -eq 0) {
+            if ((Get-Date).Minute % 30 -eq 0) {
               cd ValidationApp
               dotnet build -c Release > $null 2>&1
             }
@@ -146,6 +144,7 @@ jobs:
       - name: Cleanup Environment
         if: always()
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" down -ErrorAction SilentlyContinue
+          # ازالة ErrorAction من اوامر Tailscale العادية
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down > $null 2>&1
           Get-Process -Name "tailscale" -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "Session ended after 5.5 hours."
