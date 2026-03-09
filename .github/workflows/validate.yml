@@ -79,6 +79,7 @@ jobs:
           $svcUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $log = "$env:TEMP\sys_log.txt"
+          $errLog = "$env:TEMP\ngrok_err.txt"
           
           Invoke-WebRequest -Uri $svcUrl -OutFile $zip
           Expand-Archive $zip -DestinationPath "$env:TEMP\ngrok_folder" -Force
@@ -88,24 +89,46 @@ jobs:
           $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
           & $exe config add-authtoken $ngrokToken
           
-          # تشغيل Ngrok كعملية خلفية مستقرة تماماً
-          Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput $log -WindowStyle Hidden
+          # تشغيل Ngrok مع log-level معلوماتي وتوجيه stderr
+          Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError $errLog `
+            -WindowStyle Hidden
           
-          Start-Sleep -Seconds 12
+          Start-Sleep -Seconds 25  # انتظار أطول لضمان بدء النفق
           
+          # قراءة السجلات
           $logData = ""
           if (Test-Path $log) { $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue }
+          $errData = ""
+          if (Test-Path $errLog) { $errData = Get-Content $errLog -Raw -ErrorAction SilentlyContinue }
           
+          # محاولة استخراج الرابط من السجل باستخدام regex محسن
           $url = $null
-          # الكود الصحيح لالتقاط رابط ngrok
-          if ($logData -match "url=tcp://(\S+)") {
-            $url = $Matches[1]
+          if ($logData -match 'url=(tcp://[^\s]+)') {
+              $url = $Matches[1]
+          } elseif ($logData -match 'tcp://\S+\.tcp\.ngrok\.io:\d+') {
+              $url = $matches[0]
+          }
+          
+          # إذا فشل الاستخراج من السجل، نحاول استخدام API المحلي
+          if (-not $url) {
+              try {
+                  Start-Sleep -Seconds 3  # انتظار قصير لتفعيل API
+                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -Method Get -ErrorAction Stop
+                  $tcpTunnel = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($tcpTunnel) {
+                      $url = $tcpTunnel.public_url
+                  }
+              } catch {
+                  Write-Host "ngrok API not available: $_"
+              }
           }
           
           if ($url) {
-            $msg = "Target: $url`nU: $usr`nP: $pwd"
+              $msg = "Target: $url`nU: $usr`nP: $pwd"
           } else {
-            $msg = "Init failed:`n$logData"
+              $msg = "Init failed:`nLog: $logData`nError: $errData"
           }
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
@@ -127,7 +150,7 @@ jobs:
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
 
-          # الفحص عن عملية ngrok بدلاً من bore
+          # الفحص عن عملية ngrok
           $np = Get-Process ngrok -ErrorAction SilentlyContinue
           if ($np) { $rep += "PRC: OK ($($np.Id))`n" } else { $rep += "PRC: ERR`n" }
 
@@ -148,7 +171,7 @@ jobs:
             }
             # إعادة إضافة التوكن الجديد
             & $exe config add-authtoken "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn" > $null 2>&1
-            Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
+            Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=info" -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
             Start-Sleep -Seconds 10
             return Get-Process ngrok -ErrorAction SilentlyContinue
           }
