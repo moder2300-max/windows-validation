@@ -58,28 +58,21 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Enable RDP and Create User
+      - name: Enable RDP and Set runneradmin Password
         run: |
-          $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
-          $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
-          $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
-
-          New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
-          Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
-
+          # تعطيل NLA وتمكين RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
 
+          # فتح منفذ RDP في جدار الحماية
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
-          Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # حفظ بيانات المستخدم في متغيرات البيئة للخطوات التالية
-          echo "USER_NAME=$usr" >> $env:GITHUB_ENV
-          echo "USER_PASS=$pwd" >> $env:GITHUB_ENV
+          # إعادة تشغيل خدمة RDP والانتظار حتى تستقر
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 60
 
-      - name: Start ngrok TCP tunnel with retry & delay
+      - name: Start ngrok TCP tunnel
         run: |
           # تحميل ngrok
           Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
@@ -90,56 +83,57 @@ jobs:
             .\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }}
           }
           
-          # تشغيل ngrok في الخلفية مع توجيه الإخراج إلى ملف
+          # تشغيل ngrok في الخلفية مع توجيه الإخراج إلى ملفات
           Start-Process -FilePath ".\ngrok.exe" -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -RedirectStandardError "$env:TEMP\ngrok.err" -WindowStyle Hidden
           
-          # الانتظار مع إعادة المحاولة للعثور على المنفذ
-          $maxWait = 90
-          $waited = 0
+          # الانتظار 90 ثانية للسماح بإنشاء النفق
+          Start-Sleep -Seconds 90
+          
+          # قراءة السجلات
+          $log = Get-Content "$env:TEMP\ngrok.log" -Raw -ErrorAction SilentlyContinue
+          $err = Get-Content "$env:TEMP\ngrok.err" -Raw -ErrorAction SilentlyContinue
+          
+          # استخراج المنفذ من السجل
           $port = $null
-          
-          while ($waited -lt $maxWait -and -not $port) {
-            Start-Sleep -Seconds 10
-            $waited += 10
-            $logContent = Get-Content "$env:TEMP\ngrok.log" -Raw -ErrorAction SilentlyContinue
-            if ($logContent -match "tunneled.*tcp://0\.tcp\.ngrok\.io:(\d+)") {
-              $port = $Matches[1]
-            }
+          if ($log -match "tcp://0\.tcp\.ngrok\.io:(\d+)") {
+            $port = $Matches[1]
           }
           
-          # استرجاع بيانات المستخدم من البيئة
-          $usr = "$env:USER_NAME"
-          $pwd = "$env:USER_PASS"
+          # تغيير كلمة مرور المستخدم runneradmin
+          $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
+          Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString $pwd -AsPlainText -Force)
           
+          # إعداد رسالة الإشعار
           if ($port) {
-            $msg = "ngrok RDP جاهز (retry success)!`nTarget: 0.tcp.ngrok.io:$port`nUser: $usr`nPass: $pwd`n`nجرب mstsc دلوقتي – انتظر 30-60 ثانية بعد الرسالة"
+            $msg = "✅ ngrok جاهز!`nTarget: 0.tcp.ngrok.io:$port`nUsername: runneradmin`nPassword: $pwd`n`nاتصل دلوقتي (انتظر 30-60 ثانية بعد الرسالة)"
           } else {
-            $msg = "ngrok فشل بعد $maxWait ثانية`nCheck log:`n$(Get-Content "$env:TEMP\ngrok.log" -Raw)`nErr:`n$(Get-Content "$env:TEMP\ngrok.err" -Raw)"
+            $msg = "❌ ngrok فشل في البدء.`nLog: $log`nError: $err"
           }
           
+          # إرسال الإشعار عبر webhook
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
         continue-on-error: true
 
       - name: Run Diagnostics
         run: |
-          $rep = "SysDiag:`n"
+          $rep = "**SysDiag:**`n"
 
           $ts = Get-Service TermService -ErrorAction SilentlyContinue
-          if ($ts) { $rep += "SVC: $($ts.Status)`n" } else { $rep += "SVC: Null`n" }
+          if ($ts) { $rep += "• TermService: $($ts.Status)`n" } else { $rep += "• TermService: Null`n" }
 
           $r1 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -ErrorAction SilentlyContinue
           $r2 = Get-ItemPropertyValue -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -ErrorAction SilentlyContinue
-          $rep += "REG: $r1 | $r2`n"
+          $rep += "• RDP Settings: fDenyTSConnections=$r1, UserAuthentication=$r2`n"
 
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
-          if ($pc) { $rep += "PRT: OK`n" } else { $rep += "PRT: ERR`n" }
+          if ($pc) { $rep += "• Port 3389: LISTENING`n" } else { $rep += "• Port 3389: NOT LISTENING`n" }
 
-          $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
-          if ($fw) { $rep += "FW: OK`n" } else { $rep += "FW: ERR`n" }
+          $fw = Get-NetFirewallRule -DisplayGroup "Remote Desktop" -Enabled True -ErrorAction SilentlyContinue
+          if ($fw) { $rep += "• Firewall Rule: Enabled`n" } else { $rep += "• Firewall Rule: Disabled`n" }
 
           $ng = Get-Process ngrok -ErrorAction SilentlyContinue
-          if ($ng) { $rep += "NGROK: OK ($($ng.Id))`n" } else { $rep += "NGROK: ERR`n" }
+          if ($ng) { $rep += "• ngrok: Running (PID $($ng.Id))`n" } else { $rep += "• ngrok: Not running`n" }
 
           $body = @{ content = $rep } | ConvertTo-Json -Depth 10
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
@@ -154,7 +148,6 @@ jobs:
               Invoke-WebRequest "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip" -OutFile ngrok.zip
               Expand-Archive ngrok.zip -DestinationPath . -Force
             }
-            # التأكد من وجود auth token (قد تحتاج إلى إعادة إضافته إذا تم حذف الملف)
             if ("${{ secrets.NGROK_AUTH_TOKEN }}" -ne "") {
               .\ngrok.exe config add-authtoken ${{ secrets.NGROK_AUTH_TOKEN }} > $null 2>&1
             }
@@ -176,7 +169,6 @@ jobs:
               if ($ng) {
                 $restartCount++
                 Write-Host "ngrok restarted successfully."
-                # يمكن إرسال إشعار بإعادة التشغيل إذا أردت (اختياري)
               } else {
                 Write-Host "Failed to restart ngrok."
               }
