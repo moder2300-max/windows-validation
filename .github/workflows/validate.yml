@@ -84,8 +84,9 @@ jobs:
           Expand-Archive $zip -DestinationPath "$env:TEMP\ngrok_folder" -Force
           $exe = "$env:TEMP\ngrok_folder\ngrok.exe"
           
-          # إضافة التوكن الخاص بك (تم إلغاء التعليق وإضافة التوكن)
-          & $exe config add-authtoken "3AbRCO6lv4Mjqj7EQ7FtY2QT9OQ_7gW6KETgB1KEShcNcTCcC"
+          # إضافة التوكن الجديد
+          $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
+          & $exe config add-authtoken $ngrokToken
           
           # تشغيل Ngrok كعملية خلفية مستقرة تماماً
           Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput $log -WindowStyle Hidden
@@ -145,8 +146,8 @@ jobs:
               Invoke-WebRequest -Uri $svcUrl -OutFile $zip
               Expand-Archive $zip -DestinationPath "$env:TEMP\ngrok_folder" -Force
             }
-            # إعادة إضافة التوكن (لأنه قد يتم حذف الملفات)
-            & $exe config add-authtoken "3AbRCO6lv4Mjqj7EQ7FtY2QT9OQ_7gW6KETgB1KEShcNcTCcC" > $null 2>&1
+            # إعادة إضافة التوكن الجديد
+            & $exe config add-authtoken "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn" > $null 2>&1
             Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout" -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
             Start-Sleep -Seconds 10
             return Get-Process ngrok -ErrorAction SilentlyContinue
